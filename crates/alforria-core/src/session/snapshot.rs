@@ -248,9 +248,8 @@ fn lock_for(gitdir: &Path) -> Arc<Mutex<()>> {
         .clone()
 }
 
-/// The git-backed [`Snapshot`] — a line-for-line port of
-/// `snapshot/index.ts` (only the error channels differ: soft git failures
-/// are logged, never thrown).
+/// The git-backed [`Snapshot`]. Recovery operations propagate Git and
+/// filesystem errors so callers never mistake a failed restore for success.
 #[derive(Clone)]
 pub struct GitSnapshot {
     runner: std::sync::Arc<dyn SnapshotRunner>,
@@ -271,6 +270,13 @@ impl Drop for GitSnapshot {
         }
         cvar.notify_all();
     }
+}
+
+fn snapshot_error(operation: &str, hash: &str, result: &GitResult) -> CoreError {
+    CoreError::Storage(format!(
+        "snapshot {hash}: git {operation} failed ({}): {}",
+        result.exit_code, result.stderr
+    ))
 }
 
 impl GitSnapshot {
@@ -779,7 +785,7 @@ impl GitSnapshot {
     }
 
     /// `restore` (`snapshot/index.ts:382-406`).
-    fn restore_impl(&self, snapshot: &str) {
+    fn restore_impl(&self, snapshot: &str) -> Result<(), CoreError> {
         let _guard = self.lock();
         let result = self.git(
             &self.args(&CORE, &["read-tree", snapshot]),
@@ -793,24 +799,15 @@ impl GitSnapshot {
                 None,
             );
             if checkout.exit_code == 0 {
-                return;
+                return Ok(());
             }
-            tracing::error!(
-                "failed to restore snapshot: snapshot={snapshot} exitCode={} stderr={}",
-                checkout.exit_code,
-                checkout.stderr
-            );
-            return;
+            return Err(snapshot_error("checkout-index", snapshot, &checkout));
         }
-        tracing::error!(
-            "failed to restore snapshot: snapshot={snapshot} exitCode={} stderr={}",
-            result.exit_code,
-            result.stderr
-        );
+        Err(snapshot_error("read-tree", snapshot, &result))
     }
 
     /// `revert` (`snapshot/index.ts:408-524`).
-    fn revert_impl(&self, patches: Vec<PatchPart>) {
+    fn revert_impl(&self, patches: Vec<PatchPart>) -> Result<(), CoreError> {
         let _guard = self.lock();
         struct Op {
             hash: String,
@@ -850,7 +847,33 @@ impl GitSnapshot {
             }
         }
 
-        let single = |op: &Op| {
+        // Validate every referenced tree before touching any file. A missing
+        // object is an inspection failure, never evidence of file absence.
+        let mut checked = HashSet::new();
+        for op in &ops {
+            if checked.insert(&op.hash) {
+                let result = self.git(
+                    &self.args(&CORE, &["cat-file", "-e", &format!("{}^{{tree}}", op.hash)]),
+                    Some(&self.worktree),
+                    None,
+                );
+                if result.exit_code != 0 {
+                    return Err(snapshot_error("inspect tree", &op.hash, &result));
+                }
+            }
+        }
+
+        let remove = |op: &Op| -> Result<(), CoreError> {
+            match std::fs::remove_file(&op.file) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(CoreError::Storage(format!(
+                    "snapshot revert could not remove {}: {error}",
+                    op.file
+                ))),
+            }
+        };
+        let single = |op: &Op| -> Result<(), CoreError> {
             tracing::info!("reverting: file={} hash={}", op.file, op.hash);
             let result = self.git(
                 &self.args(&CORE, &["checkout", &op.hash, "--", &op.file]),
@@ -858,22 +881,21 @@ impl GitSnapshot {
                 None,
             );
             if result.exit_code == 0 {
-                return;
+                return Ok(());
             }
             let tree = self.git(
                 &self.args(&CORE, &["ls-tree", &op.hash, "--", &op.rel]),
                 Some(&self.worktree),
                 None,
             );
-            if tree.exit_code == 0 && !tree.text.trim().is_empty() {
-                tracing::info!(
-                    "file existed in snapshot but checkout failed, keeping: file={}",
-                    op.file
-                );
-                return;
+            if tree.exit_code != 0 {
+                return Err(snapshot_error("ls-tree", &op.hash, &tree));
+            }
+            if !tree.text.is_empty() {
+                return Err(snapshot_error("checkout", &op.hash, &result));
             }
             tracing::info!("file did not exist in snapshot, deleting: file={}", op.file);
-            let _ = std::fs::remove_file(&op.file);
+            remove(op)
         };
 
         let mut i = 0usize;
@@ -895,7 +917,7 @@ impl GitSnapshot {
                 j += 1;
             }
             if run.len() == 1 {
-                single(first);
+                single(first)?;
                 i = j;
                 continue;
             }
@@ -903,12 +925,7 @@ impl GitSnapshot {
             cmd.extend(run.iter().map(|op| op.rel.as_str()));
             let tree = self.git(&self.args(&CORE, &cmd), Some(&self.worktree), None);
             if tree.exit_code != 0 {
-                tracing::info!("batched ls-tree failed, falling back to single-file revert");
-                for op in &run {
-                    single(op);
-                }
-                i = j;
-                continue;
+                return Err(snapshot_error("ls-tree", &first.hash, &tree));
             }
             let have: HashSet<&str> = tree
                 .text
@@ -930,7 +947,7 @@ impl GitSnapshot {
                 if result.exit_code != 0 {
                     tracing::info!("batched checkout failed, falling back to single-file revert");
                     for op in &run {
-                        single(op);
+                        single(op)?;
                     }
                     i = j;
                     continue;
@@ -939,11 +956,12 @@ impl GitSnapshot {
             for op in &run {
                 if !have.contains(op.rel.as_str()) {
                     tracing::info!("file did not exist in snapshot, deleting: file={}", op.file);
-                    let _ = std::fs::remove_file(&op.file);
+                    remove(op)?;
                 }
             }
             i = j;
         }
+        Ok(())
     }
 
     /// `diff` (`snapshot/index.ts:526-544`).
@@ -1249,7 +1267,7 @@ impl Snapshot for GitSnapshot {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || snapshot.restore_impl(&id))
                 .await
-                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))
+                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))?
         })
     }
 
@@ -1258,7 +1276,7 @@ impl Snapshot for GitSnapshot {
         Box::pin(async move {
             tokio::task::spawn_blocking(move || snapshot.revert_impl(patches))
                 .await
-                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))
+                .map_err(|_| CoreError::Storage("snapshot task failed".to_string()))?
         })
     }
 
@@ -1766,6 +1784,85 @@ mod git_tests {
             .filter(|line| !line.is_empty())
             .map(String::from)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn missing_snapshot_preserves_all_files_and_reports_failure() {
+        let dir = TempDir::new("snap-missing");
+        init_repo(dir.path());
+        let file = dir.path().join("important.txt");
+        std::fs::write(&file, "original\n").unwrap();
+        let (snap, _data) = snapshot(dir.path());
+        let valid = snap.track().await.unwrap();
+        std::fs::write(&file, "user work\n").unwrap();
+        let missing = "0000000000000000000000000000000000000001";
+        for patches in [
+            vec![PatchPart {
+                hash: missing.into(),
+                files: vec![file.to_string_lossy().into_owned()],
+            }],
+            vec![
+                PatchPart {
+                    hash: valid.clone(),
+                    files: vec![file.to_string_lossy().into_owned()],
+                },
+                PatchPart {
+                    hash: missing.into(),
+                    files: vec![dir.path().join("other.txt").to_string_lossy().into_owned()],
+                },
+            ],
+        ] {
+            assert!(snap.revert(patches).await.is_err());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "user work\n");
+        }
+        assert!(snap.restore(missing).await.is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "user work\n");
+    }
+
+    struct FailRecovery;
+
+    impl SnapshotRunner for FailRecovery {
+        fn run(
+            &self,
+            cwd: Option<&Path>,
+            env: &[(&str, String)],
+            args: &[&str],
+            stdin: Option<&str>,
+        ) -> SnapshotOutput {
+            if args
+                .iter()
+                .any(|arg| matches!(*arg, "checkout" | "checkout-index"))
+            {
+                return SnapshotOutput {
+                    code: 1,
+                    stdout: Vec::new(),
+                    stderr: "injected checkout failure".into(),
+                };
+            }
+            SubprocessSnapshotRunner.run(cwd, env, args, stdin)
+        }
+    }
+
+    #[tokio::test]
+    async fn checkout_errors_are_returned_without_deleting_existing_files() {
+        let dir = TempDir::new("snap-checkout-failure");
+        init_repo(dir.path());
+        let file = dir.path().join("important.txt");
+        std::fs::write(&file, "original\n").unwrap();
+        let (snap, _data) = snapshot(dir.path());
+        let hash = snap.track().await.unwrap();
+        let mut failing = (*snap).clone();
+        failing.runner = Arc::new(FailRecovery);
+        std::fs::write(&file, "user work\n").unwrap();
+        assert!(failing
+            .revert(vec![PatchPart {
+                hash: hash.clone(),
+                files: vec![file.to_string_lossy().into_owned()]
+            }])
+            .await
+            .is_err());
+        assert!(failing.restore(&hash).await.is_err());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "user work\n");
     }
 
     #[tokio::test]
