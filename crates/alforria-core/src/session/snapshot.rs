@@ -1027,7 +1027,7 @@ impl GitSnapshot {
             None,
         );
         let entries = split_nul(&status_result.text);
-        for pair in entries.chunks_exact(2) {
+        for pair in entries.as_chunks::<2>().0 {
             let (code, file) = (pair[0].as_str(), pair[1].as_str());
             if code.is_empty() || file.is_empty() {
                 continue;
