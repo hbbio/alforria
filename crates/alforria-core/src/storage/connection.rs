@@ -19,11 +19,10 @@ const OPEN_PRAGMAS: &[&str] = &[
 
 /// A `rusqlite` connection behind a `Mutex`.
 ///
-/// All storage APIs are synchronous; async callers on the tokio runtime
-/// should go through `tokio::task::spawn_blocking` (the handle is
-/// `block_in_place`-friendly — it never holds the lock across an await
-/// point because it never awaits). There is no async SQLite driver: the
-/// bundled SQLite is synchronous and that is fine at this scale.
+/// Synchronous calls yield the multithreaded Tokio worker before waiting on
+/// SQLite or this mutex. Single-threaded runtimes must use `spawn_blocking`;
+/// ordinary synchronous callers run directly. Transactions remain on one
+/// connection and never hold its lock across an await.
 #[derive(Debug)]
 pub struct Storage {
     conn: Mutex<Connection>,
@@ -34,7 +33,10 @@ impl Storage {
     /// (`database.ts` wires `DatabaseMigration.apply` right after the
     /// PRAGMAs, so opening an incompatible database fails here).
     pub fn open(path: impl AsRef<Path>) -> Result<Storage, CoreError> {
-        let path = path.as_ref();
+        database_blocking(|| Self::open_impl(path.as_ref()))
+    }
+
+    fn open_impl(path: &Path) -> Result<Storage, CoreError> {
         let mut conn = Connection::open(path)?;
         Self::configure(&conn)?;
         refuse_foreign_schema(&conn, path)?;
@@ -47,6 +49,10 @@ impl Storage {
     /// Open an in-memory database (no `WAL` journal — SQLite keeps the
     /// `memory` journal mode there).
     pub fn open_in_memory() -> Result<Storage, CoreError> {
+        database_blocking(Self::open_in_memory_impl)
+    }
+
+    fn open_in_memory_impl() -> Result<Storage, CoreError> {
         let mut conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
         migration::apply(&mut conn)?;
@@ -63,15 +69,19 @@ impl Storage {
 
     /// Run a closure with the connection.
     pub fn with_connection<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
-        let conn = self.lock();
-        f(&conn)
+        database_blocking(|| {
+            let conn = self.lock();
+            f(&conn)
+        })
     }
 
     /// Run a closure with mutable access to the connection (needed for
     /// transactions).
     pub fn with_connection_mut<R>(&self, f: impl FnOnce(&mut Connection) -> R) -> R {
-        let mut conn = self.lock();
-        f(&mut conn)
+        database_blocking(|| {
+            let mut conn = self.lock();
+            f(&mut conn)
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -98,6 +108,16 @@ impl Storage {
             conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))?;
             Ok(())
         })
+    }
+}
+
+fn database_blocking<R>(operation: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(operation)
+    } else {
+        operation()
     }
 }
 
@@ -163,6 +183,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn contended_sqlite_does_not_stall_a_tokio_worker() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let dir = TempDir::new("busy-runtime");
+        let path = dir.path().join("db.sqlite");
+        let storage = Arc::new(Storage::open(&path).unwrap());
+        storage
+            .with_connection(|conn| conn.execute("CREATE TABLE probe (id INTEGER)", []))
+            .unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (tick_tx, tick_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let connection = Connection::open(path).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            ready_tx.send(()).unwrap();
+            let responsive = tick_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+            connection.execute_batch("COMMIT").unwrap();
+            responsive
+        });
+        ready_rx.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let write = tokio::spawn(async move {
+                storage
+                    .with_connection(|conn| conn.execute("INSERT INTO probe VALUES (1)", []))
+                    .unwrap();
+            });
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tick_tx.send(()).unwrap();
+            write.await.unwrap();
+        });
+        assert!(
+            holder.join().unwrap(),
+            "the timer must run while SQLite waits for the foreign writer"
+        );
     }
 
     #[test]
