@@ -17,6 +17,12 @@ const OPEN_PRAGMAS: &[&str] = &[
     "PRAGMA foreign_keys = ON",
 ];
 
+/// Additive local optimization; the pinned upstream tables and migration
+/// journal stay unchanged. Install on existing databases as well as new ones.
+const TURN_INDEX_SQL: &str = "CREATE INDEX IF NOT EXISTS alforria_message_session_parent_idx
+    ON message (session_id, json_extract(data, '$.parentID'), time_created, id)
+    WHERE json_extract(data, '$.role') = 'assistant'";
+
 /// A `rusqlite` connection behind a `Mutex`.
 ///
 /// Synchronous calls yield the multithreaded Tokio worker before waiting on
@@ -41,6 +47,7 @@ impl Storage {
         Self::configure(&conn)?;
         refuse_foreign_schema(&conn, path)?;
         migration::apply(&mut conn)?;
+        conn.execute_batch(TURN_INDEX_SQL)?;
         Ok(Storage {
             conn: Mutex::new(conn),
         })
@@ -56,6 +63,7 @@ impl Storage {
         let mut conn = Connection::open_in_memory()?;
         Self::configure(&conn)?;
         migration::apply(&mut conn)?;
+        conn.execute_batch(TURN_INDEX_SQL)?;
         Ok(Storage {
             conn: Mutex::new(conn),
         })
@@ -161,6 +169,45 @@ mod tests {
     use super::*;
 
     use crate::storage::test_support::TempDir;
+
+    #[test]
+    fn installs_turn_index_when_opening_an_existing_database() {
+        let dir = TempDir::new("turn-index-upgrade");
+        let path = dir.path().join("db.sqlite");
+        let mut connection = Connection::open(&path).unwrap();
+        migration::apply(&mut connection).unwrap();
+        // This represents a database from before the local query index.
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'alforria_message_session_parent_idx'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        for _ in 0..2 {
+            Storage::open(&path).unwrap().with_connection(|conn| {
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM pragma_index_list('message') WHERE name = 'alforria_message_session_parent_idx'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                    1
+                );
+                // Additive indexes do not alter the upstream journal.
+                assert_eq!(
+                    conn.query_row("SELECT COUNT(*) FROM migration", [], |row| row.get::<_, usize>(0))
+                        .unwrap(),
+                    migration::MIGRATION_IDS.len()
+                );
+            });
+        }
+    }
 
     #[test]
     fn a_database_migrated_by_opencode_v2_is_refused_with_a_way_out() {

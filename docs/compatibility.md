@@ -19,6 +19,11 @@ The default global directories are `~/.config/alforria`,
 `alforria migrate` moves an install over; `alforria migrate --fresh` provides
 an independent start when the legacy database is incompatible.
 
+Alforria adds a local SQLite index for turn-specific assistant lookups on both
+new and existing databases. It leaves the pinned table definitions and upstream
+migration journal unchanged. Background summaries read only the requested turn
+and its snapshot step parts, including when the turn predates compaction.
+
 Undo snapshots own their objects independently of the source repository. Git
 references retain new snapshot trees, and cleanup packs objects without
 expiring recovery points. Older alternate-based stores are dissociated before
@@ -55,6 +60,8 @@ for exact commands. The manual backend benchmarks run with:
 cargo test -p alforria-core benchmark_ --lib -- --ignored --nocapture
 ```
 
-These measure constant active context with increasing archived history, and
-bounded-result/no-match searches over a 32 MiB repository. Their timings are
-local microbenchmarks, not an end-to-end speed comparison with OpenCode.
+These measure constant active context with increasing archived history, a
+scripted processor step including its completed background summary, and
+bounded-result/no-match searches over a 32 MiB repository. The step benchmark
+uses file-backed SQLite and a no-op snapshot service. These local timings do
+not establish an end-to-end speed comparison with OpenCode.

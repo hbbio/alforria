@@ -304,12 +304,25 @@ impl MessageStore {
     /// `hydrate` (message-v2.ts:98-122): batch part lookup per message,
     /// ordered by (message_id, id).
     fn hydrate(&self, rows: &[Message]) -> Result<Vec<WithParts>, CoreError> {
+        self.hydrate_parts(rows, false)
+    }
+
+    fn hydrate_parts(
+        &self,
+        rows: &[Message],
+        snapshots_only: bool,
+    ) -> Result<Vec<WithParts>, CoreError> {
         let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
         let mut part_lists: HashMap<String, Vec<V1Part>> = HashMap::new();
         if !ids.is_empty() {
             let placeholders = vec!["?"; ids.len()].join(", ");
+            let filter = if snapshots_only {
+                " AND json_extract(data, '$.type') IN ('step-start', 'step-finish')"
+            } else {
+                ""
+            };
             let sql = format!(
-                "SELECT * FROM part WHERE message_id IN ({placeholders}) ORDER BY message_id, id"
+                "SELECT * FROM part WHERE message_id IN ({placeholders}){filter} ORDER BY message_id, id"
             );
             let part_rows = self.storage.with_connection(|conn| {
                 let mut stmt = conn.prepare(&sql)?;
@@ -336,6 +349,20 @@ impl MessageStore {
                 })
             })
             .collect()
+    }
+
+    /// Load the requested turn regardless of compaction. The user and its
+    /// assistant replies are found by indexed lookups, in chronological order.
+    /// Only snapshot step parts are hydrated; summary diffs are omitted.
+    pub(crate) fn turn_snapshots(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<WithParts>, SessionError> {
+        let rows = self.storage.with_connection(|conn| {
+            query_messages(conn, &turn_query(), [session_id, message_id])
+        })?;
+        Ok(self.hydrate_parts(&rows, true)?)
     }
 
     /// `MessageV2.stream` (message-v2.ts:469-490): page-until-exhausted in
@@ -429,6 +456,18 @@ impl MessageStore {
 
     /// `MessageV2.get` (message-v2.ts:506-519).
     pub fn get(&self, session_id: &str, message_id: &str) -> Result<WithParts, SessionError> {
+        Ok(WithParts {
+            info: self.get_info(session_id, message_id)?,
+            parts: self.parts(message_id)?,
+        })
+    }
+
+    /// Read metadata without hydrating the message's parts.
+    pub(crate) fn get_info(
+        &self,
+        session_id: &str,
+        message_id: &str,
+    ) -> Result<V1Message, SessionError> {
         let row = self.storage.with_connection(|conn| {
             let mut stmt =
                 conn.prepare("SELECT * FROM message WHERE id = ?1 AND session_id = ?2")?;
@@ -443,10 +482,7 @@ impl MessageStore {
                 "Message not found: {message_id}"
             )));
         };
-        Ok(WithParts {
-            info: info_from_row(&row)?,
-            parts: self.parts(message_id)?,
-        })
+        Ok(info_from_row(&row)?)
     }
 }
 
@@ -458,6 +494,19 @@ const ALL_COLUMNS: &str = "*";
 const COLUMNS_WITHOUT_DIFFS: &str = "id, session_id, time_created, time_updated, \
      CASE WHEN json_type(data, '$.summary.diffs') IS NULL THEN data \
      ELSE json_set(data, '$.summary.diffs', json('[]')) END AS data";
+
+fn turn_query() -> String {
+    // Separate lookups avoid an OR predicate that can scan the session's
+    // entire history. The second arm uses the local parent-ID index.
+    format!(
+        "SELECT {COLUMNS_WITHOUT_DIFFS} FROM message WHERE session_id = ?1 AND id = ?2
+         UNION ALL
+         SELECT {COLUMNS_WITHOUT_DIFFS} FROM message
+         WHERE session_id = ?1 AND json_extract(data, '$.role') = 'assistant'
+           AND json_extract(data, '$.parentID') = ?2 AND id != ?2
+         ORDER BY time_created, id"
+    )
+}
 
 fn query_messages(
     conn: &Connection,
@@ -817,6 +866,97 @@ mod tests {
                 start.elapsed().as_micros() / 10
             );
         }
+    }
+
+    #[test]
+    fn turn_snapshot_query_uses_indexed_parent_lookups_and_only_snapshot_parts() {
+        use crate::session::test_support::{create_session, harness, text_part};
+        let h = harness("turn-snapshot-query", vec![]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        for (id, time) in [("msg_u", 1.0), ("msg_other", 3.0)] {
+            h.services
+                .sessions
+                .update_message(&user_message(id, &session.id, time))
+                .unwrap();
+        }
+        for (id, parent, time) in [
+            ("msg_reply_1", "msg_u", 2),
+            ("msg_other_reply", "msg_other", 4),
+            ("msg_reply_2", "msg_u", 5),
+        ] {
+            h.services
+                .sessions
+                .update_message(&assistant_message(
+                    id,
+                    &session.id,
+                    time,
+                    parent,
+                    None,
+                    None,
+                ))
+                .unwrap();
+            for part in [
+                V1Part::StepStart {
+                    id: format!("prt_{id}_start"),
+                    session_id: session.id.clone(),
+                    message_id: id.into(),
+                    snapshot: Some(format!("snapshot_{id}")),
+                },
+                text_part(
+                    &session.id,
+                    id,
+                    &format!("prt_{id}_text"),
+                    "not needed for diff",
+                ),
+            ] {
+                h.services.sessions.update_part(&part).unwrap();
+            }
+        }
+        let messages = h
+            .services
+            .messages
+            .turn_snapshots(&session.id, "msg_u")
+            .unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|msg| message_id(&msg.info))
+                .collect::<Vec<_>>(),
+            ["msg_u", "msg_reply_1", "msg_reply_2"]
+        );
+        assert!(messages[0].parts.is_empty());
+        for reply in &messages[1..] {
+            assert!(matches!(reply.parts.as_slice(), [V1Part::StepStart { .. }]));
+        }
+        let plan = h.services.storage.with_connection(|conn| {
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {}", turn_query()))
+                .unwrap()
+                .query_map([&session.id, "msg_u"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        });
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("sqlite_autoindex_message_1")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("alforria_message_session_parent_idx")
+                    && line.contains("<expr>=?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|line| line.starts_with("SCAN message")),
+            "{plan:?}"
+        );
+        assert!(h
+            .services
+            .messages
+            .turn_snapshots("other_session", "msg_u")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
