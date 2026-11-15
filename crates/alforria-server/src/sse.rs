@@ -123,8 +123,6 @@ pub struct GlobalBus {
     tx: broadcast::Sender<GlobalEvent>,
     /// Keeps the core-bus bridge listener alive while any handle exists.
     bridge: Option<Arc<Subscription>>,
-    /// Retained subscriptions of chained per-instance buses (M7.1).
-    chains: Arc<std::sync::Mutex<Vec<Arc<Subscription>>>>,
 }
 
 impl Default for GlobalBus {
@@ -138,7 +136,6 @@ impl GlobalBus {
         GlobalBus {
             tx: broadcast::channel(alforria_core::event::bus::CHANNEL_CAPACITY).0,
             bridge: None,
-            chains: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -147,12 +144,7 @@ impl GlobalBus {
     /// additionally as a `sync` frame (`event-v2-bridge.ts:26-62`).
     pub fn bridged(bus: Arc<EventBus>) -> GlobalBus {
         let mut global = GlobalBus::new();
-        let bridged = global.clone();
-        let subscription = bus.listen(Arc::new(move |event| {
-            for frame in bridge_frames(event) {
-                bridged.emit(frame);
-            }
-        }));
+        let subscription = global.chain(bus);
         global.bridge = Some(Arc::new(subscription));
         global
     }
@@ -160,17 +152,16 @@ impl GlobalBus {
     /// Bridge an additional (per-instance) EventV2 bus into the global bus
     /// — every instance publishes onto its own bus in the Rust port, and
     /// the bridge listener is the TS process-wide EventV2's listener.
-    pub fn chain(&self, bus: Arc<EventBus>) {
-        let chained = self.clone();
-        let subscription = bus.listen(Arc::new(move |event| {
+    /// The instance owns the guard and drops it when disposed. Capture only
+    /// the sender, avoiding a cycle through this bus's subscription owners.
+    #[must_use]
+    pub fn chain(&self, bus: Arc<EventBus>) -> Subscription {
+        let tx = self.tx.clone();
+        bus.listen(Arc::new(move |event| {
             for frame in bridge_frames(event) {
-                chained.emit(frame);
+                let _ = tx.send(frame);
             }
-        }));
-        self.chains
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(Arc::new(subscription));
+        }))
     }
 
     /// `GlobalBus.emit` (global.ts:9-17) — ids are assigned at construction

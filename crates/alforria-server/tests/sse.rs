@@ -623,6 +623,45 @@ fn located_fixture() -> Arc<ServerContext> {
 }
 
 #[tokio::test]
+async fn chained_bus_releases_its_sender_when_owners_drop() {
+    let global = alforria_server::sse::GlobalBus::new();
+    let core = Arc::new(EventBus::new(Storage::open_in_memory().unwrap(), None));
+    let mut receiver = global.subscribe();
+    let bridge = global.chain(core.clone());
+    drop(global);
+    drop(core);
+    drop(bridge);
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    ));
+}
+
+#[tokio::test]
+async fn disposed_instances_stop_forwarding_even_with_external_service_owners() {
+    let ctx = located_fixture();
+    let mut receiver = ctx.global_bus.subscribe();
+    for _ in 0..20 {
+        let services = ctx.instances.load(Path::new("/repo")).unwrap();
+        receiver.try_recv().unwrap(); // project.updated
+        ctx.instances.dispose_directory(Path::new("/repo"));
+        receiver.try_recv().unwrap(); // server.instance.disposed
+        services
+            .events
+            .publish(
+                &alforria_core::MODELS_DEV_REFRESHED,
+                serde_json::json!({}),
+                PublishOptions::default(),
+            )
+            .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn v1_event_sees_instance_bus_events() {
     let ctx = located_fixture();
     let (_status, _headers, mut frames) = open(&ctx, "/event?directory=/repo").await;
