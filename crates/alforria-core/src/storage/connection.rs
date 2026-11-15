@@ -111,7 +111,7 @@ impl Storage {
     }
 }
 
-fn database_blocking<R>(operation: impl FnOnce() -> R) -> R {
+pub(crate) fn database_blocking<R>(operation: impl FnOnce() -> R) -> R {
     if tokio::runtime::Handle::try_current()
         .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
     {
