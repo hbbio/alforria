@@ -364,6 +364,40 @@ async fn global_event_heartbeat() {
 // ------------------------------------------------------------ v2 /api/event
 
 #[tokio::test]
+async fn api_event_overflow_closes_instead_of_sending_heartbeats_forever() {
+    let ctx = fixture();
+    let (_, _, mut frames) = open(&ctx, "/api/event").await;
+    frames.next().await.unwrap();
+    frames.next().await.unwrap();
+    for _ in 0..500 {
+        publish(&ctx, Some("/repo"), None);
+        tokio::task::yield_now().await;
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while frames.next().await.is_some() {}
+    })
+    .await
+    .expect("an overflowed stream must close");
+}
+
+#[tokio::test]
+async fn api_event_disconnect_releases_idle_subscription() {
+    let ctx = fixture();
+    let baseline = ctx.global_bus.receiver_count();
+    let (_, _, mut frames) = open(&ctx, "/api/event").await;
+    frames.next().await.unwrap();
+    assert_eq!(ctx.global_bus.receiver_count(), baseline + 1);
+    drop(frames);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while ctx.global_bus.receiver_count() != baseline {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("disconnect must release the listener without another publish");
+}
+
+#[tokio::test]
 async fn api_event_stream() {
     let ctx = fixture();
     let (status, headers, mut frames) = open(&ctx, "/api/event").await;

@@ -480,26 +480,23 @@ pub async fn api_event(State(ctx): State<Arc<ServerContext>>) -> Response {
     // raw `EventV2` payload on the bridge frames (`event-v2-bridge.ts`:
     // the process-wide `EventV2` service TS subscribes to here).
     let (event_tx, mut events) = mpsc::channel::<Payload>(SUBSCRIBER_CAPACITY);
-    let event_tx = Arc::new(std::sync::Mutex::new(Some(event_tx)));
-    let listener_tx = Arc::clone(&event_tx);
     let mut global = ctx.global_bus.subscribe();
     tokio::spawn(async move {
         loop {
-            let received = global.recv().await;
+            let received = tokio::select! {
+                _ = event_tx.closed() => return,
+                received = global.recv() => received,
+            };
             let payload = match received {
                 Ok(event) => event.v2,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
+                // A gap invalidates this subscription. Dropping the only
+                // queue sender closes the response after queued events drain.
+                Err(_) => return,
             };
             let Some(payload) = payload else {
                 continue;
             };
-            let mut sender = listener_tx.lock().unwrap_or_else(|p| p.into_inner());
-            let sender = match sender.as_mut() {
-                Some(sender) => sender,
-                None => return,
-            };
-            if sender.try_send(payload).is_err() {
+            if event_tx.try_send(payload).is_err() {
                 return;
             }
         }
@@ -508,10 +505,6 @@ pub async fn api_event(State(ctx): State<Arc<ServerContext>>) -> Response {
     let interval = ctx.heartbeat.v2;
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
-        // Hold the listener's sender for the lifetime of the stream —
-        // dropping it on disconnect unsubscribes.
-        let _listener_sender = event_tx;
-
         let connected = Payload {
             id: new_event_id(),
             metadata: None,
@@ -536,6 +529,7 @@ pub async fn api_event(State(ctx): State<Arc<ServerContext>>) -> Response {
         let mut heartbeat = Box::pin(tokio::time::sleep(interval));
         loop {
             tokio::select! {
+                _ = tx.closed() => return,
                 event = events.recv() => match event {
                     Some(event) => {
                         let frame = sse_frame(&serde_json::to_string(&event).unwrap());
