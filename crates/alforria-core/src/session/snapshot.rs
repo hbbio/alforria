@@ -1839,9 +1839,10 @@ mod git_tests {
     async fn unusual_filenames_survive_patch_diff_and_batched_revert() {
         let dir = TempDir::new("snap-filenames");
         init_repo(dir.path());
-        let mut names = vec!["b.txt", "café.txt", "[literal].txt", ":magic.txt"];
+        let mut names = vec!["b.txt", "café.txt", "[literal].txt"];
         if !cfg!(windows) {
             names.extend([
+                ":magic.txt",
                 "quote\".txt",
                 "back\\slash.txt",
                 "tab\t.txt",
@@ -1997,9 +1998,9 @@ mod git_tests {
         assert_eq!(
             files,
             vec![
-                dir.path().join("a.txt").to_string_lossy().into_owned(),
-                dir.path().join("b.txt").to_string_lossy().into_owned(),
-                dir.path().join("new.txt").to_string_lossy().into_owned(),
+                git_path(&dir.path().join("a.txt")),
+                git_path(&dir.path().join("b.txt")),
+                git_path(&dir.path().join("new.txt")),
             ]
         );
 

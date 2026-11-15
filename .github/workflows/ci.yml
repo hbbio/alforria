@@ -9,6 +9,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  portability:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Recovery, authorization and storage regressions
+        run: |
+          cargo test -p alforria-core session::snapshot::git_tests --lib
+          cargo test -p alforria-core move_authorizes_both_endpoints --lib
+          cargo test -p alforria-core storage::connection::tests --lib
+          cargo test -p alforria-core active_context_stops --lib
+      - name: Real PTY lifecycle and websocket tests
+        run: |
+          cargo test -p alforria-server --lib pty::tests
+          cargo test -p alforria-server --test pty
+
   web:
     runs-on: ubuntu-latest
     defaults:

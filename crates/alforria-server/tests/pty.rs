@@ -1,6 +1,6 @@
 //! M6.8 acceptance: the PTY service, connect tickets and the v1+v2 connect
-//! websockets, exercised against a live listener with real `/bin/sh`
-//! sessions.
+//! websockets, exercised against a live listener with real portable Python
+//! processes.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,6 +118,14 @@ impl Fixture {
     }
 }
 
+fn python() -> &'static str {
+    if cfg!(windows) {
+        "python"
+    } else {
+        "python3"
+    }
+}
+
 /// Create a session through the v1 surface and return its info.
 async fn create(fx: &Fixture, command: &str, args: &[&str]) -> Value {
     let response = fx
@@ -156,7 +164,7 @@ async fn v1_pty_http_family() {
         s.get("path").is_some() && s.get("name").is_some() && s.get("acceptable").is_some()
     }));
 
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     assert!(pty_id.starts_with("pty_"));
     assert_eq!(created["status"], "running");
@@ -165,7 +173,7 @@ async fn v1_pty_http_family() {
         format!("Terminal {}", &pty_id[pty_id.len() - 4..])
     );
     assert!(created["pid"].as_u64().unwrap() > 0);
-    assert_eq!(created["command"], "/bin/sh");
+    assert_eq!(created["command"], python());
     assert_eq!(created["cwd"], fx.directory);
 
     let list = fx.get("/pty").await;
@@ -223,7 +231,7 @@ async fn v1_pty_http_family() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_family_keeps_exited_sessions() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "exit 4"]).await;
+    let created = create(&fx, python(), &["-c", "import sys; sys.exit(4)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -296,7 +304,7 @@ async fn v2_family_keeps_exited_sessions() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_token_enforcement() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let path = format!("/pty/{pty_id}/connect-token");
 
@@ -372,7 +380,7 @@ async fn connect_token_enforcement() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connect_handshake_order() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
 
     // Missing session → 404 before decoding the query.
@@ -453,7 +461,7 @@ async fn ws_handshake(fx: &Fixture, path: &str, origin: Option<&str>, host: Opti
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_connect_refuses_foreign_origins() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let v1 = format!("/pty/{pty_id}/connect?directory={}", fx.directory);
     let v2 = format!(
@@ -513,7 +521,7 @@ async fn ws_connect_refuses_foreign_origins() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_replay_meta_frame_and_live_output() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
 
     // Seed the buffer with output before connecting.
@@ -557,7 +565,7 @@ async fn ws_replay_meta_frame_and_live_output() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_close_1000_when_the_session_is_removed() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let mut stream = ws_connect(
         &fx,
@@ -593,7 +601,7 @@ async fn ws_close_1000_when_the_session_is_removed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ws_1001_on_server_close() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let mut stream = ws_connect(
         &fx,
@@ -621,7 +629,7 @@ async fn ws_1001_on_server_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v2_exited_session_closes_with_4404() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "exit 4"]).await;
+    let created = create(&fx, python(), &["-c", "import sys; sys.exit(4)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     // Wait for the exit.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
@@ -657,7 +665,7 @@ async fn v2_exited_session_closes_with_4404() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn v1_exited_session_connects_are_404_before_upgrade() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "exit 4"]).await;
+    let created = create(&fx, python(), &["-c", "import sys; sys.exit(4)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
@@ -678,8 +686,8 @@ async fn v1_exited_session_connects_are_404_before_upgrade() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     let fx = fixture().await;
-    let created = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
-    let other = create(&fx, "/bin/sh", &["-c", "sleep 30"]).await;
+    let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
+    let other = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
     let other_id = other["id"].as_str().unwrap().to_string();
 

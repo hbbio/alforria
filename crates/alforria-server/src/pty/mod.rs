@@ -653,11 +653,15 @@ mod tests {
 
     #[test]
     fn create_lists_updates_and_removes_a_real_pty() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "sleep 5".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    "import time; time.sleep(5)".to_string(),
+                ]),
                 cwd: None,
                 title: Some("test".to_string()),
                 env: None,
@@ -688,11 +692,15 @@ mod tests {
 
     #[test]
     fn exited_sessions_retain_output_until_removed() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "echo hi; exit 4".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    "import sys; print('hi', flush=True); sys.exit(4)".to_string(),
+                ]),
                 cwd: None,
                 title: None,
                 env: None,
@@ -713,13 +721,18 @@ mod tests {
     /// bun-pty (the TS default backend) reports a signal-killed child as
     /// `exitCode: 1`, both on the session and in `pty.exited`.
     #[test]
+    #[cfg(unix)]
     fn signal_killed_sessions_exit_with_code_one() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let mut exited = service.events.subscribe("pty.exited");
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "kill -9 $$".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec![
+                    "-c".to_string(),
+                    "import os, signal; os.kill(os.getpid(), signal.SIGKILL)".to_string(),
+                ]),
                 cwd: None,
                 title: None,
                 env: None,
@@ -745,13 +758,15 @@ mod tests {
 
     #[test]
     fn attach_replays_buffer_from_cursor() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
                 args: Some(vec![
                     "-c".to_string(),
-                    "sleep 0.2; echo hello; sleep 30".to_string(),
+                    "import time; time.sleep(0.2); print('hello', flush=True); time.sleep(30)"
+                        .to_string(),
                 ]),
                 cwd: None,
                 title: None,
@@ -804,15 +819,16 @@ mod tests {
 
     #[test]
     fn attach_reports_not_found_and_exited() {
-        let service = PtyService::new(spawn_backend(), "/tmp");
+        let directory = tempfile::tempdir().unwrap();
+        let service = PtyService::new(spawn_backend(), directory.path().to_str().unwrap());
         assert!(matches!(
             service.attach("pty_missing", None, Box::new(|_| {}), Box::new(|_| {})),
             Err(PtyError::NotFound)
         ));
         let created = service
             .create(&PtyCreateInput {
-                command: Some("/bin/sh".to_string()),
-                args: Some(vec!["-c".to_string(), "true".to_string()]),
+                command: Some(if cfg!(windows) { "python" } else { "python3" }.to_string()),
+                args: Some(vec!["-c".to_string(), "pass".to_string()]),
                 cwd: None,
                 title: None,
                 env: None,
