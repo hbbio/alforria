@@ -105,6 +105,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: oven-sh/setup-bun@v2
+        if: runner.os == 'Linux'
+        with:
+          bun-version: 1.4.4
+      - name: Verify web source and embedded bundle
+        if: runner.os == 'Linux'
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run check
+          bun run build
+          bun run verify:bundle
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Install nextest
