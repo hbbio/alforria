@@ -121,7 +121,13 @@ pub const MAX_DIFF_PATCH_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIFF_LOAD_BYTES: usize = 32 * 1024 * 1024;
 
 /// The `-c` flag sets (`snapshot/index.ts:25-27`).
-const CORE: [&str; 4] = ["-c", "core.longpaths=true", "-c", "core.symlinks=true"];
+const CORE: [&str; 5] = [
+    "--literal-pathspecs",
+    "-c",
+    "core.longpaths=true",
+    "-c",
+    "core.symlinks=true",
+];
 const CFG: [&str; 6] = [
     "-c",
     "core.autocrlf=false",
@@ -741,6 +747,7 @@ impl GitSnapshot {
                     // revert never restores the original path.
                     "--no-renames",
                     "--name-only",
+                    "-z",
                     hash,
                     "--",
                     ".",
@@ -759,14 +766,7 @@ impl GitSnapshot {
                 files: Vec::new(),
             };
         }
-        let files: Vec<String> = result
-            .text
-            .trim()
-            .split('\n')
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(String::from)
-            .collect();
+        let files = split_nul(&result.text);
         // Hide ignored-file removals from the user-facing patch output.
         let ignored = self.ignore(&files);
         SnapshotPatch {
@@ -774,12 +774,7 @@ impl GitSnapshot {
             files: files
                 .iter()
                 .filter(|file| !ignored.contains(*file))
-                .map(|file| {
-                    self.worktree
-                        .join(file)
-                        .to_string_lossy()
-                        .replace('\\', "/")
-                })
+                .map(|file| git_path(&self.worktree.join(file)))
                 .collect(),
         }
     }
@@ -921,7 +916,7 @@ impl GitSnapshot {
                 i = j;
                 continue;
             }
-            let mut cmd: Vec<&str> = vec!["ls-tree", "--name-only", &first.hash, "--"];
+            let mut cmd: Vec<&str> = vec!["ls-tree", "--name-only", "-z", &first.hash, "--"];
             cmd.extend(run.iter().map(|op| op.rel.as_str()));
             let tree = self.git(&self.args(&CORE, &cmd), Some(&self.worktree), None);
             if tree.exit_code != 0 {
@@ -929,9 +924,7 @@ impl GitSnapshot {
             }
             let have: HashSet<&str> = tree
                 .text
-                .trim()
-                .split('\n')
-                .map(str::trim)
+                .split('\0')
                 .filter(|line| !line.is_empty())
                 .collect();
             let list: Vec<&Op> = run
@@ -998,6 +991,7 @@ impl GitSnapshot {
                     "diff",
                     "--no-ext-diff",
                     "--name-status",
+                    "-z",
                     "--no-renames",
                     from,
                     to,
@@ -1008,13 +1002,9 @@ impl GitSnapshot {
             Some(&self.directory),
             None,
         );
-        for line in status_result.text.trim().split('\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let Some((code, file)) = line.split_once('\t') else {
-                continue;
-            };
+        let entries = split_nul(&status_result.text);
+        for pair in entries.chunks_exact(2) {
+            let (code, file) = (pair[0].as_str(), pair[1].as_str());
             if code.is_empty() || file.is_empty() {
                 continue;
             }
@@ -1036,6 +1026,7 @@ impl GitSnapshot {
                     "--no-ext-diff",
                     "--no-renames",
                     "--numstat",
+                    "-z",
                     from,
                     to,
                     "--",
@@ -1046,7 +1037,7 @@ impl GitSnapshot {
             None,
         );
         let mut rows: Vec<Row> = Vec::new();
-        for line in numstat.text.trim().split('\n') {
+        for line in numstat.text.split('\0') {
             if line.is_empty() {
                 continue;
             }
@@ -1179,6 +1170,11 @@ impl GitSnapshot {
     /// `load` (`snapshot/index.ts:588-682`) — the `cat-file --batch`
     /// bulk fetch, falling back to `None` (per-file show) on any failure.
     fn load(&self, rows: &[Row], from: &str, to: &str) -> Option<HashMap<String, BeforeAfter>> {
+        // The batch protocol uses newline-separated object expressions.
+        // Fetch these paths with argv-based `show` instead.
+        if rows.iter().any(|row| row.file.contains(['\n', '\r'])) {
+            return None;
+        }
         let mut refs: Vec<(String, bool, String)> = Vec::new();
         for row in rows {
             if row.binary {
@@ -1402,7 +1398,16 @@ fn relative(worktree: &Path, file: &str) -> String {
         Ok(rel) => rel.to_path_buf(),
         Err(_) => path.to_path_buf(),
     };
-    rel.to_string_lossy().replace('\\', "/")
+    git_path(&rel)
+}
+
+fn git_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    }
 }
 
 /// `clash` (`snapshot/index.ts:445`).
@@ -1784,6 +1789,67 @@ mod git_tests {
             .filter(|line| !line.is_empty())
             .map(String::from)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn unusual_filenames_survive_patch_diff_and_batched_revert() {
+        let dir = TempDir::new("snap-filenames");
+        init_repo(dir.path());
+        let mut names = vec!["b.txt", "café.txt", "[literal].txt", ":magic.txt"];
+        if !cfg!(windows) {
+            names.extend([
+                "quote\".txt",
+                "back\\slash.txt",
+                "tab\t.txt",
+                "line\n.txt",
+                " leading.txt",
+                "trailing.txt ",
+            ]);
+        }
+        for name in &names {
+            std::fs::write(dir.path().join(name), "original\n").unwrap();
+        }
+        let (snap, _data) = snapshot(dir.path());
+        let base = snap.track().await.unwrap();
+        for name in &names {
+            std::fs::write(dir.path().join(name), "changed\n").unwrap();
+        }
+        let patch = snap.patch(&base).await.unwrap();
+        let expected: HashSet<_> = names
+            .iter()
+            .map(|name| git_path(&dir.path().join(name)))
+            .collect();
+        assert_eq!(
+            patch.files.iter().cloned().collect::<HashSet<_>>(),
+            expected
+        );
+        let after = snap.track().await.unwrap();
+        let diffs = snap.diff_full(&base, &after).await.unwrap();
+        assert_eq!(
+            diffs
+                .iter()
+                .filter_map(|diff| diff.file.as_deref())
+                .collect::<HashSet<_>>(),
+            names.iter().copied().collect()
+        );
+        for diff in diffs {
+            let patch = diff.patch.unwrap();
+            assert!(patch.contains("-original"), "{patch:?}");
+            assert!(patch.contains("+changed"), "{patch:?}");
+        }
+        snap.revert(vec![PatchPart {
+            hash: base,
+            files: patch.files,
+        }])
+        .await
+        .unwrap();
+        for name in names {
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                "original\n",
+                "{name:?}"
+            );
+        }
     }
 
     #[tokio::test]
