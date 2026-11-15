@@ -9,6 +9,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  parity:
+    runs-on: ubuntu-latest
+    env:
+      OPENCODE_PARITY: '1'
+      OPENCODE_TS_SRC: ${{ github.workspace }}/.reference/opencode
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: anomalyco/opencode
+          ref: 88c6c7abc7f320b6aabed2634ac0b2d6e6ecea67
+          path: .reference/opencode
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: bun install --frozen-lockfile
+        working-directory: .reference/opencode
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compare live API, schema and event inventories
+        run: cargo test -p alforria --test parity p0_ -- --ignored
+      - name: Compare structured output against both runtimes
+        run: cargo test -p alforria --test parity p8_ -- --ignored
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: parity-reports
+          path: target/parity
+          if-no-files-found: ignore
+
   portability:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -65,3 +96,8 @@ jobs:
         run: cargo install cargo-nextest --locked || true
       - name: Test
         run: cargo nextest run || cargo test --all
+      - name: Offline structured-output parity
+        env:
+          OPENCODE_PARITY: '1'
+          OPENCODE_PARITY_GOLDEN: '1'
+        run: cargo test -p alforria --test parity p8_ -- --ignored
