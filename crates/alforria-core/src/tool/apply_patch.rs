@@ -284,10 +284,16 @@ async fn run(
         })
         .collect();
 
-    // One ask with all relative paths (apply_patch.ts:205-215).
+    // Authorize every mutation before writing anything. Moves replace the
+    // destination contents, so both endpoints require edit permission.
+    let mut seen = std::collections::HashSet::new();
     let relative_paths: Vec<String> = file_changes
         .iter()
-        .map(|change| relative(&instance.worktree, &change.file_path))
+        .flat_map(|change| {
+            std::iter::once(change.file_path.as_str()).chain(change.move_path.as_deref())
+        })
+        .map(|path| relative(&instance.worktree, path))
+        .filter(|path| seen.insert(path.clone()))
         .collect();
     ctx.ask
         .ask(AskRequest {
@@ -628,6 +634,60 @@ mod tests {
             "one\ndeux\n"
         );
         std::fs::remove_dir_all(temp.path()).ok();
+    }
+
+    #[tokio::test]
+    async fn move_authorizes_both_endpoints_before_any_mutation() {
+        use crate::event::bus::EventBus;
+        use crate::session::permission::{PermissionService, SessionAsk};
+        use crate::storage::Storage;
+        for denied in [Some("a.txt"), Some("b.txt"), None] {
+            let temp = crate::storage::test_support::TempDir::new("apply-move-rules");
+            std::fs::write(temp.path().join("a.txt"), "source\n").unwrap();
+            std::fs::write(temp.path().join("b.txt"), "protected\n").unwrap();
+            let events = Arc::new(EventBus::new(Storage::open_in_memory().unwrap(), None));
+            let service = Arc::new(PermissionService::new(events));
+            let mut rules = json!([{"permission":"edit", "pattern":"*", "action":"allow"}]);
+            if let Some(path) = denied {
+                rules
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"permission":"edit", "pattern":path, "action":"deny"}));
+            }
+            let ask = SessionAsk::new(
+                service,
+                "session",
+                "message",
+                "call",
+                serde_json::from_value(rules).unwrap(),
+            );
+            let recorder = RecordingAsk::new();
+            let inst = instance(temp.path());
+            let extra = Extra::default();
+            let mut context = ctx(&recorder, &inst, &extra);
+            context.ask = &ask;
+            let patch = "*** Begin Patch\n*** Add File: new.txt\n+new\n*** Update File: a.txt\n*** Move to: ./sub/../b.txt\n@@\n-source\n+replacement\n*** End Patch";
+            let result = (tool().execute)(json!({"patchText":patch}), context).await;
+            if denied.is_some() {
+                assert!(result.is_err(), "{denied:?}");
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("a.txt")).unwrap(),
+                    "source\n"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
+                    "protected\n"
+                );
+                assert!(!temp.path().join("new.txt").exists());
+            } else {
+                result.unwrap();
+                assert!(!temp.path().join("a.txt").exists());
+                assert_eq!(
+                    std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
+                    "replacement\n"
+                );
+            }
+        }
     }
 
     #[tokio::test]
