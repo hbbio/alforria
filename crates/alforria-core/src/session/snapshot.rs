@@ -536,7 +536,14 @@ impl GitSnapshot {
         let objects: HashSet<_> = entries
             .text
             .split('\0')
-            .filter_map(|entry| entry.split_once('\t')?.0.split_whitespace().nth(1))
+            .filter_map(|entry| {
+                let mut fields = entry.split_once('\t')?.0.split_whitespace();
+                let mode = fields.next()?;
+                let object = fields.next()?;
+                // Gitlinks name commits owned by submodule repositories;
+                // their objects are not required to recover this worktree.
+                (mode != "160000" && !object.bytes().all(|byte| byte == b'0')).then_some(object)
+            })
             .collect();
         let input = objects.into_iter().collect::<Vec<_>>().join("\n");
         let prefix = self.pack_prefix()?;
@@ -2452,6 +2459,33 @@ mod git_tests {
             "snapshots must not borrow objects"
         );
         assert!(gitdir.join("index").exists(), "source index copied");
+    }
+
+    #[tokio::test]
+    async fn seed_owns_file_blobs_without_copying_submodule_commit_objects() {
+        let dir = TempDir::new("snap-seed-submodule");
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "original\n").unwrap();
+        let submodule = dir.path().join("vendor");
+        std::fs::create_dir(&submodule).unwrap();
+        init_repo(&submodule);
+        std::fs::write(submodule.join("file.txt"), "submodule original\n").unwrap();
+        commit_all(&submodule);
+        commit_all(dir.path());
+
+        let (snap, _data) = snapshot(dir.path());
+        let hash = snap.track().await.expect("snapshot of a submodule index");
+        std::fs::write(dir.path().join("a.txt"), "current\n").unwrap();
+        std::fs::write(submodule.join("file.txt"), "submodule current\n").unwrap();
+        snap.restore(&hash).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(submodule.join("file.txt")).unwrap(),
+            "submodule current\n"
+        );
     }
 
     #[tokio::test]
