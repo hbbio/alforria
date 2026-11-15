@@ -48,7 +48,7 @@ struct SubscriberState {
 
 struct Session {
     info: PtyInfo,
-    proc: Box<dyn Proc>,
+    proc: Arc<dyn Proc>,
     buffer: Vec<u16>,
     buffer_cursor: u64,
     cursor: u64,
@@ -132,17 +132,18 @@ impl PtyService {
         let mut env = input.env.clone().unwrap_or_default();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("OPENCODE_TERMINAL".to_string(), "1".to_string());
-        let proc = self
-            .backend
-            .spawn(
-                &command,
-                &args,
-                &spawn::SpawnOpts {
-                    cwd: cwd.clone(),
-                    env,
-                },
-            )
-            .map_err(|err| defect(&err))?;
+        let proc: Arc<dyn Proc> = Arc::from(
+            self.backend
+                .spawn(
+                    &command,
+                    &args,
+                    &spawn::SpawnOpts {
+                        cwd: cwd.clone(),
+                        env,
+                    },
+                )
+                .map_err(|err| defect(&err))?,
+        );
         let info = PtyInfo {
             id: id.clone(),
             title: input
@@ -158,19 +159,23 @@ impl PtyService {
             exit_code: None,
         };
         {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             let data_id = id.clone();
             proc.on_data(Box::new(move |chunk| {
-                handle_data(&inner, &data_id, chunk);
+                if let Some(inner) = inner.upgrade() {
+                    handle_data(&inner, &data_id, chunk);
+                }
             }));
         }
         {
-            let inner = Arc::clone(&self.inner);
+            let inner = Arc::downgrade(&self.inner);
             let events = Arc::clone(&self.events);
             let location = self.location.clone();
             let exit_id = id.clone();
             proc.on_exit(Box::new(move |exit| {
-                handle_exit(&inner, &events, &location, &exit_id, exit);
+                if let Some(inner) = inner.upgrade() {
+                    handle_exit(&inner, &events, &location, &exit_id, exit);
+                }
             }));
         }
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -178,7 +183,7 @@ impl PtyService {
             id.clone(),
             Session {
                 info: info.clone(),
-                proc,
+                proc: proc.clone(),
                 buffer: Vec::new(),
                 buffer_cursor: 0,
                 cursor: 0,
@@ -193,6 +198,7 @@ impl PtyService {
             "pty.created",
             serde_json::json!({ "info": info }),
         );
+        proc.activate();
         Ok(info)
     }
 
