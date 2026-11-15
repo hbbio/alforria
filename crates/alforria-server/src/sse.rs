@@ -381,7 +381,10 @@ pub async fn v1_event(
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "closing lagged event stream for client resync");
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
                 _ = &mut heartbeat => {
@@ -439,7 +442,10 @@ pub async fn global_event(State(ctx): State<Arc<ServerContext>>) -> Response {
                             return;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "closing lagged global event stream for client resync");
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 },
                 _ = &mut heartbeat => {

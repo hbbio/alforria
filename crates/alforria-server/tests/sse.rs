@@ -364,6 +364,32 @@ async fn global_event_heartbeat() {
 // ------------------------------------------------------------ v2 /api/event
 
 #[tokio::test]
+async fn v1_streams_close_on_broadcast_gaps_and_can_reconnect() {
+    for uri in ["/event?directory=/repo", "/global/event"] {
+        let ctx = fixture();
+        let (_, _, mut frames) = open(&ctx, uri).await;
+        frames.next().await.unwrap();
+        // No await: the pump cannot drain the broadcast ring during this burst.
+        for _ in 0..alforria_core::event::bus::CHANNEL_CAPACITY * 2 {
+            publish(&ctx, Some("/repo"), None);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while frames.next().await.is_some() {}
+        })
+        .await
+        .expect("lag must terminate the stream so clients resnapshot");
+        let (_, _, mut frames) = open(&ctx, uri).await;
+        assert!(frames.next().await.unwrap().contains("server.connected"));
+        publish(&ctx, Some("/repo"), None);
+        assert!(frames
+            .next_event()
+            .await
+            .unwrap()
+            .contains("models-dev.refreshed"));
+    }
+}
+
+#[tokio::test]
 async fn api_event_overflow_closes_instead_of_sending_heartbeats_forever() {
     let ctx = fixture();
     let (_, _, mut frames) = open(&ctx, "/api/event").await;
