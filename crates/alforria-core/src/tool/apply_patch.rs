@@ -43,9 +43,11 @@ pub fn parameters() -> Value {
 #[derive(Debug)]
 struct FileChange {
     file_path: String,
+    io_path: String,
     new_content: String,
     kind: &'static str, // "add" | "update" | "delete" | "move"
     move_path: Option<String>,
+    move_io_path: Option<String>,
     diff: String,
     additions: usize,
     deletions: usize,
@@ -130,6 +132,9 @@ async fn run(
         };
         let file_path = ts_resolve(&instance.directory, hunk_path);
         let file_path_str = file_path.to_string_lossy().to_string();
+        let io_path = crate::tool::file_path::resolve(&file_path)
+            .to_string_lossy()
+            .into_owned();
         assert_external_directory(
             &ctx,
             Some(&file_path_str),
@@ -152,9 +157,11 @@ async fn run(
                 let (additions, deletions) = crate::tool::diff::diff_line_counts("", &next.text);
                 file_changes.push(FileChange {
                     file_path: file_path_str,
+                    io_path,
                     new_content: next.text.clone(),
                     kind: "add",
                     move_path: None,
+                    move_io_path: None,
                     diff: diff.clone(),
                     additions,
                     deletions,
@@ -166,13 +173,13 @@ async fn run(
             Hunk::Update {
                 move_path, chunks, ..
             } => {
-                let stat = tokio::fs::metadata(&file_path).await;
+                let stat = tokio::fs::metadata(&io_path).await;
                 if stat.map(|s| s.is_dir()).unwrap_or(true) {
                     return Err(ToolError::Failed(format!(
                         "apply_patch verification failed: Failed to read file to update: {file_path_str}"
                     )));
                 }
-                let raw = tokio::fs::read(&file_path)
+                let raw = tokio::fs::read(&io_path)
                     .await
                     .map_err(|error| {
                         ToolError::Failed(format!(
@@ -208,6 +215,7 @@ async fn run(
                     // move would write the file and then delete it.
                     .filter(|move_path| *move_path != file_path);
                 if let Some(move_path) = &move_path {
+                    crate::tool::file_path::reject_move_aliases(&file_path, move_path)?;
                     let move_str = move_path.to_string_lossy().to_string();
                     assert_external_directory(
                         &ctx,
@@ -222,12 +230,18 @@ async fn run(
 
                 file_changes.push(FileChange {
                     file_path: file_path_str,
+                    io_path,
                     new_content: update.content,
                     kind: if move_path.is_some() {
                         "move"
                     } else {
                         "update"
                     },
+                    move_io_path: move_path.as_ref().map(|path| {
+                        crate::tool::file_path::resolve(path)
+                            .to_string_lossy()
+                            .into_owned()
+                    }),
                     move_path: move_path.map(|path| path.to_string_lossy().to_string()),
                     diff: diff.clone(),
                     additions,
@@ -238,7 +252,7 @@ async fn run(
                 total_diff.push('\n');
             }
             Hunk::Delete { .. } => {
-                let raw = tokio::fs::read(&file_path).await.map_err(|error| {
+                let raw = tokio::fs::read(&io_path).await.map_err(|error| {
                     ToolError::Failed(format!("apply_patch verification failed: {error}"))
                 })?;
                 let source = bom::split(&String::from_utf8_lossy(&raw));
@@ -247,9 +261,11 @@ async fn run(
                 let deletions = source.text.split('\n').count();
                 file_changes.push(FileChange {
                     file_path: file_path_str,
+                    io_path,
                     new_content: String::new(),
                     kind: "delete",
                     move_path: None,
+                    move_io_path: None,
                     diff: delete_diff.clone(),
                     additions: 0,
                     deletions,
@@ -286,15 +302,19 @@ async fn run(
 
     // Authorize every mutation before writing anything. Moves replace the
     // destination contents, so both endpoints require edit permission.
-    let mut seen = std::collections::HashSet::new();
-    let relative_paths: Vec<String> = file_changes
-        .iter()
-        .flat_map(|change| {
-            std::iter::once(change.file_path.as_str()).chain(change.move_path.as_deref())
-        })
-        .map(|path| relative(&instance.worktree, path))
-        .filter(|path| seen.insert(path.clone()))
-        .collect();
+    let relative_paths = crate::tool::file_path::edit_patterns(
+        &instance.worktree,
+        file_changes.iter().flat_map(|change| {
+            [
+                Some(Path::new(&change.file_path)),
+                Some(Path::new(&change.io_path)),
+                change.move_path.as_deref().map(Path::new),
+                change.move_io_path.as_deref().map(Path::new),
+            ]
+            .into_iter()
+            .flatten()
+        }),
+    );
     ctx.ask
         .ask(AskRequest {
             permission: "edit".to_string(),
@@ -308,6 +328,17 @@ async fn run(
         })
         .await?;
 
+    for change in &file_changes {
+        crate::tool::file_path::verify(Path::new(&change.file_path), Path::new(&change.io_path))?;
+        if let (Some(destination), Some(resolved)) = (&change.move_path, &change.move_io_path) {
+            crate::tool::file_path::reject_move_aliases(
+                Path::new(&change.file_path),
+                Path::new(destination),
+            )?;
+            crate::tool::file_path::verify(Path::new(destination), Path::new(resolved))?;
+        }
+    }
+
     // Apply the changes (apply_patch.ts:217-258).
     let mut updates: Vec<(String, &'static str)> = Vec::new();
     for change in &file_changes {
@@ -315,31 +346,23 @@ async fn run(
             None
         } else {
             change
-                .move_path
+                .move_io_path
                 .as_deref()
-                .or(Some(change.file_path.as_str()))
+                .or(Some(change.io_path.as_str()))
         };
         match change.kind {
             "add" => {
-                write_all(
-                    &change.file_path,
-                    &bom::join(&change.new_content, change.bom),
-                )
-                .await?;
+                write_all(&change.io_path, &bom::join(&change.new_content, change.bom)).await?;
                 updates.push((change.file_path.clone(), "add"));
             }
             "update" => {
-                write_all(
-                    &change.file_path,
-                    &bom::join(&change.new_content, change.bom),
-                )
-                .await?;
+                write_all(&change.io_path, &bom::join(&change.new_content, change.bom)).await?;
                 updates.push((change.file_path.clone(), "change"));
             }
             "move" => {
-                if let Some(move_path) = &change.move_path {
+                if let Some(move_path) = &change.move_io_path {
                     write_all(move_path, &bom::join(&change.new_content, change.bom)).await?;
-                    tokio::fs::remove_file(&change.file_path)
+                    tokio::fs::remove_file(&change.io_path)
                         .await
                         .map_err(|error| {
                             ToolError::Failed(format!(
@@ -348,7 +371,7 @@ async fn run(
                             ))
                         })?;
                     updates.push((change.file_path.clone(), "unlink"));
-                    updates.push((move_path.clone(), "add"));
+                    updates.push((change.move_path.clone().unwrap(), "add"));
                 }
             }
             "delete" => {
@@ -461,17 +484,7 @@ async fn run(
 }
 
 async fn write_all(path: &str, contents: &str) -> Result<(), ToolError> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            ToolError::Failed(format!(
-                "Failed to create directory {}: {error}",
-                parent.display()
-            ))
-        })?;
-    }
-    tokio::fs::write(path, contents)
-        .await
-        .map_err(|error| ToolError::Failed(format!("Failed to write file {path}: {error}")))
+    bom::write_with_dirs(Path::new(path), contents).await
 }
 
 #[cfg(test)]

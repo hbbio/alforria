@@ -33,6 +33,12 @@ manifests. Recovery refuses obstructing directories and symlinked parent paths
 rather than removing unrelated work. This favors recoverability over an
 automatic age-based disk limit.
 
+File edits authorize both the requested name and its resolved target. Patch
+moves reject symlink endpoints and distinct names for the same file, including
+hard links. Ordinary writes replace only the authorized directory entry, so a
+hard-linked name cannot overwrite a separately protected file. Tools recheck
+resolved paths after permission waits before applying changes.
+
 Linux CI runs the ordinary Rust and web suites. macOS and Windows CI run
 focused recovery, permission, storage, history, and real PTY tests. Release
 verification additionally runs the wider suite on all three systems, with

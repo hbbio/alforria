@@ -50,14 +50,35 @@ pub async fn read_file(file_path: &Path) -> Result<Split, ToolError> {
 /// `writeWithDirs` (fs-util.ts:127): `create_dir_all(parent)` then write
 /// (spec §2.5).
 pub async fn write_with_dirs(file_path: &Path, contents: &str) -> Result<(), ToolError> {
-    if let Some(parent) = file_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| ToolError::Failed(e.to_string()))?;
-    }
-    tokio::fs::write(file_path, contents)
-        .await
-        .map_err(|e| ToolError::Failed(e.to_string()))
+    let file_path = file_path.to_path_buf();
+    let contents = contents.to_string();
+    // Replace the directory entry, rather than truncating an inode that may
+    // have another protected hard-link name. Callers pin symlink resolution.
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        let parent = file_path.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+        match std::fs::metadata(&file_path) {
+            Ok(meta) => {
+                if meta.permissions().readonly() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "file is read-only",
+                    ));
+                }
+                staged.as_file().set_permissions(meta.permissions())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        staged.write_all(contents.as_bytes())?;
+        staged.persist(&file_path).map_err(|error| error.error)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| ToolError::Failed(error.to_string()))?
+    .map_err(|error| ToolError::Failed(error.to_string()))
 }
 
 /// `Bom.syncFile` (bom.ts:22-27): re-writes the file when its BOM-ness
