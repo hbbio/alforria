@@ -106,8 +106,9 @@ impl Snapshot for DisabledSnapshot {
 // Production git snapshot (M7.3) — port of `snapshot/index.ts`
 // ---------------------------------------------------------------------------
 
-/// `prune` (`snapshot/index.ts:23`).
-const PRUNE: &str = "7.days";
+/// Undo has no expiry. Retain legacy unreferenced trees as well as the
+/// explicitly referenced snapshots created by current versions.
+const PRUNE: &str = "never";
 /// `limit` — 2 MiB (`snapshot/index.ts:24`).
 const LIMIT: u64 = 2 * 1024 * 1024;
 
@@ -729,6 +730,29 @@ impl GitSnapshot {
             None,
         );
         let hash = result.text.trim().to_string();
+        if result.exit_code != 0 || hash.is_empty() {
+            tracing::warn!("failed to write snapshot tree: {}", result.stderr);
+            return None;
+        }
+        // A tree hash stored in SQLite is invisible to Git's reachability
+        // walk. Keep a ref for the lifetime of this snapshot store, so gc
+        // cannot silently expire an undo point.
+        let retained = self.git(
+            &self.args(
+                &CORE,
+                &[
+                    "update-ref",
+                    &format!("refs/alforria/snapshots/{hash}"),
+                    &hash,
+                ],
+            ),
+            Some(&self.worktree),
+            None,
+        );
+        if retained.exit_code != 0 {
+            tracing::warn!("failed to retain snapshot: {}", retained.stderr);
+            return None;
+        }
         Some(hash)
     }
 
@@ -1220,7 +1244,7 @@ impl GitSnapshot {
 }
 
 impl GitSnapshot {
-    /// `git gc --prune=7.days` — the cleanup Interface method
+    /// Pack the snapshot store without expiring undo history.
     /// (`snapshot/index.ts:300-316`), driven hourly by the loop.
     pub fn cleanup(&self) {
         self.cleanup_impl();
@@ -1417,7 +1441,7 @@ fn clash(a: &str, b: &str) -> bool {
         || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// The hourly `git gc --prune=7.days` loop (`snapshot/index.ts:761-766`):
+/// The hourly snapshot packing loop (`snapshot/index.ts:761-766`):
 /// one run after a 1-minute delay, then every hour.
 fn spawn_cleanup_loop(snapshot: Arc<GitSnapshot>, first: Duration, interval: Duration) {
     std::thread::spawn(move || {
@@ -1789,6 +1813,26 @@ mod git_tests {
             .filter(|line| !line.is_empty())
             .map(String::from)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn historical_snapshots_remain_reachable_after_gc() {
+        let dir = TempDir::new("snap-retained");
+        init_repo(dir.path());
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "first\n").unwrap();
+        let (snap, _data) = snapshot(dir.path());
+        let first = snap.track().await.unwrap();
+        std::fs::write(&file, "second\n").unwrap();
+        snap.track().await.unwrap();
+        let gc = snap.git(
+            &snap.args(&CORE, &["gc", "--prune=now"]),
+            Some(dir.path()),
+            None,
+        );
+        assert_eq!(gc.exit_code, 0, "{}", gc.stderr);
+        snap.restore(&first).await.unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "first\n");
     }
 
     #[tokio::test]
