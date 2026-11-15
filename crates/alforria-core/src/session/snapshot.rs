@@ -22,6 +22,8 @@ use crate::tool::def::BoxFuture;
 use crate::tool::diff::{diff_line_counts, diff_lines};
 use crate::CoreError;
 
+mod recovery;
+
 /// `Snapshot.Patch` — `patch()` result (snapshot/index.ts:14-18). `files`
 /// are absolute worktree paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,66 +508,196 @@ impl GitSnapshot {
         );
     }
 
-    /// `seed` (`snapshot/index.ts:198-233`).
-    fn seed(&self) {
-        if !self.vcs_is_git {
-            return;
-        }
-        let common = self.git(
+    /// Copy the source index and its blobs into our own object database.
+    /// A source repository's gc cannot see references in this repository.
+    fn seed(&self) -> Result<(), CoreError> {
+        let index = self.git(
             &[
-                "rev-parse".to_string(),
-                "--path-format=absolute".to_string(),
-                "--git-common-dir".to_string(),
+                "rev-parse".into(),
+                "--path-format=absolute".into(),
+                "--git-path".into(),
+                "index".into(),
             ],
             Some(&self.worktree),
             None,
         );
-        if common.exit_code != 0 {
-            return;
+        if index.exit_code != 0 || !Path::new(index.text.trim()).is_file() {
+            return Ok(());
         }
-        let source = common.text.trim();
-        if source.is_empty() || !Path::new(source).exists() {
-            return;
-        }
-        // Share the source object database (and the source's own
-        // alternates, skipping any that no longer exist) so seeded blobs
-        // resolve.
-        let source_objects = Path::new(source).join("objects");
-        let mut candidates = vec![source_objects.clone()];
-        let chained = std::fs::read_to_string(source_objects.join("info").join("alternates"))
-            .unwrap_or_default();
-        for line in chained.split('\n') {
-            let line = line.trim();
-            if !line.is_empty() {
-                candidates.push(PathBuf::from(line));
-            }
-        }
-        let mut alternates: Vec<PathBuf> = Vec::new();
-        for candidate in candidates {
-            if candidate.exists() {
-                alternates.push(candidate);
-            }
-        }
-        if alternates.is_empty() {
-            return;
-        }
-        let _ = std::fs::create_dir_all(self.gitdir.join("objects").join("info"));
-        let text = alternates
-            .iter()
-            .map(|path| path.to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let _ = std::fs::write(
-            self.gitdir.join("objects").join("info").join("alternates"),
-            format!("{text}\n"),
+        std::fs::copy(index.text.trim(), self.gitdir.join("index"))?;
+        let entries = self.git(
+            &self.args(&CORE, &["ls-files", "--stage", "-z"]),
+            Some(&self.worktree),
+            None,
         );
-        // Seed the index from the source repo so already-hashed entries are
-        // reused. Best-effort: a missing/incompatible index just falls back
-        // to a full add.
-        let source_index = Path::new(source).join("index");
-        if source_index.exists() {
-            let _ = std::fs::copy(source_index, self.gitdir.join("index"));
+        if entries.exit_code != 0 {
+            return Err(snapshot_error("read seed index", "index", &entries));
         }
+        let objects: HashSet<_> = entries
+            .text
+            .split('\0')
+            .filter_map(|entry| {
+                let mut fields = entry.split_once('\t')?.0.split_whitespace();
+                let mode = fields.next()?;
+                let object = fields.next()?;
+                // Gitlinks name commits owned by submodule repositories;
+                // their objects are not required to recover this worktree.
+                (mode != "160000" && !object.bytes().all(|byte| byte == b'0')).then_some(object)
+            })
+            .collect();
+        let input = objects.into_iter().collect::<Vec<_>>().join("\n");
+        let prefix = self.pack_prefix()?;
+        let packed = self.git(
+            &[
+                "pack-objects".into(),
+                "--non-empty".into(),
+                "--quiet".into(),
+                prefix,
+            ],
+            Some(&self.worktree),
+            Some(&if input.is_empty() {
+                input
+            } else {
+                input + "\n"
+            }),
+        );
+        if packed.exit_code != 0 {
+            return Err(snapshot_error("copy seed objects", "index", &packed));
+        }
+        // Cached TREE extensions can name trees held only by the source.
+        // Reinsert the index entries so write-tree builds our own trees.
+        let refreshed = self.git(
+            &self.args(&CORE, &["update-index", "-z", "--index-info"]),
+            Some(&self.worktree),
+            Some(&entries.text),
+        );
+        if refreshed.exit_code != 0 {
+            return Err(snapshot_error("refresh seed index", "index", &refreshed));
+        }
+        Ok(())
+    }
+
+    fn pack_prefix(&self) -> Result<String, CoreError> {
+        let directory = self.gitdir.join("objects/pack");
+        std::fs::create_dir_all(&directory)?;
+        Ok(git_path(&directory.join("pack")))
+    }
+
+    /// One-time migration: preserve even unreferenced local snapshot trees,
+    /// plus retained refs and index entries, before detaching the old borrow.
+    fn dissociate(&self) -> Result<(), CoreError> {
+        let alternates = self.gitdir.join("objects/info/alternates");
+        if !alternates.exists() {
+            return Ok(());
+        }
+        let mut objects = HashSet::new();
+        for directory in std::fs::read_dir(self.gitdir.join("objects"))? {
+            let directory = directory?;
+            let name = directory.file_name().to_string_lossy().into_owned();
+            if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            for file in std::fs::read_dir(directory.path())? {
+                let file = file?;
+                let oid = format!("{name}{}", file.file_name().to_string_lossy());
+                if matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    objects.insert(oid);
+                }
+            }
+        }
+        for index in std::fs::read_dir(self.gitdir.join("objects/pack"))? {
+            let index = index?.path();
+            if index.extension().is_none_or(|extension| extension != "idx") {
+                continue;
+            }
+            let verified = self.git(
+                &self.args(&CORE, &["verify-pack", "-v", &git_path(&index)]),
+                Some(&self.worktree),
+                None,
+            );
+            if verified.exit_code != 0 {
+                return Err(snapshot_error("verify pack", "migration", &verified));
+            }
+            for line in verified.text.lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() >= 5 && matches!(fields[1], "tree" | "blob" | "commit" | "tag") {
+                    objects.insert(fields[0].to_string());
+                }
+            }
+        }
+        let input = objects.into_iter().collect::<Vec<_>>().join("\n");
+        let input = if input.is_empty() {
+            input
+        } else {
+            input + "\n"
+        };
+        let prefix = self.pack_prefix()?;
+        let packed = self.git(
+            &self.args(
+                &CORE,
+                &[
+                    "pack-objects",
+                    "--revs",
+                    "--all",
+                    "--reflog",
+                    "--indexed-objects",
+                    "--non-empty",
+                    "--quiet",
+                    &prefix,
+                ],
+            ),
+            Some(&self.worktree),
+            Some(&input),
+        );
+        if packed.exit_code != 0 {
+            return Err(snapshot_error("own borrowed objects", "migration", &packed));
+        }
+        let entries = self.git(
+            &self.args(&CORE, &["ls-files", "--stage", "-z"]),
+            Some(&self.worktree),
+            None,
+        );
+        if entries.exit_code != 0 {
+            return Err(snapshot_error("read migrated index", "migration", &entries));
+        }
+        let refreshed = self.git(
+            &self.args(&CORE, &["update-index", "-z", "--index-info"]),
+            Some(&self.worktree),
+            Some(&entries.text),
+        );
+        if refreshed.exit_code != 0 {
+            return Err(snapshot_error(
+                "refresh migrated index",
+                "migration",
+                &refreshed,
+            ));
+        }
+        // Preserve read-only access for old hashes held only in session data,
+        // which may never have had a local object or a retention reference.
+        std::fs::rename(
+            alternates,
+            self.gitdir.join("objects/info/alforria-legacy-alternates"),
+        )?;
+        Ok(())
+    }
+
+    fn recovery_env(&self) -> Result<Vec<(&'static str, String)>, CoreError> {
+        let file = self.gitdir.join("objects/info/alforria-legacy-alternates");
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let paths = text
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| self.gitdir.join("objects").join(line));
+        let value =
+            std::env::join_paths(paths).map_err(|error| CoreError::Storage(error.to_string()))?;
+        Ok(vec![(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            value.to_string_lossy().into_owned(),
+        )])
     }
 
     /// `add` (`snapshot/index.ts:235-298`).
@@ -720,8 +852,18 @@ impl GitSnapshot {
                     None,
                 );
             }
-            self.seed();
             tracing::info!("initialized");
+        }
+        if !self.gitdir.join("index").exists() {
+            if let Err(error) = self.seed() {
+                let _ = std::fs::remove_file(self.gitdir.join("index"));
+                tracing::warn!(%error, "snapshot seed failed");
+                return None;
+            }
+        }
+        if let Err(error) = self.dissociate() {
+            tracing::warn!(%error, "snapshot object migration failed");
+            return None;
         }
         self.add();
         let result = self.git(
@@ -803,182 +945,193 @@ impl GitSnapshot {
         }
     }
 
-    /// `restore` (`snapshot/index.ts:382-406`).
-    fn restore_impl(&self, snapshot: &str) -> Result<(), CoreError> {
-        let _guard = self.lock();
-        let result = self.git(
-            &self.args(&CORE, &["read-tree", snapshot]),
+    /// Give a legacy borrowed tree independent ownership before reusing it.
+    fn own_recovery_tree(&self, hash: &str, env: &[(&str, String)]) -> Result<(), CoreError> {
+        if env.is_empty() && !self.gitdir.join("objects/info/alternates").exists() {
+            return Ok(());
+        }
+        let tree = self.git_env(
+            &self.args(
+                &CORE,
+                &["rev-parse", "--verify", &format!("{hash}^{{tree}}")],
+            ),
             Some(&self.worktree),
+            env,
             None,
         );
-        if result.exit_code == 0 {
-            let checkout = self.git(
-                &self.args(&CORE, &["checkout-index", "-a", "-f"]),
+        if tree.exit_code != 0 {
+            return Err(snapshot_error("resolve tree", hash, &tree));
+        }
+        let oid = tree.text.trim();
+        // Once dissociated, an existing retention ref denotes owned objects.
+        let reference = format!("refs/alforria/snapshots/{oid}");
+        if !self.gitdir.join("objects/info/alternates").exists() {
+            let retained = self.git(
+                &self.args(&CORE, &["show-ref", "--verify", "--quiet", &reference]),
                 Some(&self.worktree),
                 None,
             );
-            if checkout.exit_code == 0 {
+            if retained.exit_code == 0 {
                 return Ok(());
             }
-            return Err(snapshot_error("checkout-index", snapshot, &checkout));
         }
-        Err(snapshot_error("read-tree", snapshot, &result))
+        let prefix = self.pack_prefix()?;
+        let packed = self.git_env(
+            &self.args(&CORE, &["pack-objects", "--revs", "--quiet", &prefix]),
+            Some(&self.worktree),
+            env,
+            Some(&format!("{oid}\n")),
+        );
+        if packed.exit_code != 0 {
+            return Err(snapshot_error("own recovery objects", hash, &packed));
+        }
+        let retained = self.git(
+            &self.args(&CORE, &["update-ref", &reference, oid]),
+            Some(&self.worktree),
+            None,
+        );
+        if retained.exit_code != 0 {
+            return Err(snapshot_error("retain recovery objects", hash, &retained));
+        }
+        Ok(())
     }
 
-    /// `revert` (`snapshot/index.ts:408-524`).
+    /// Git checks out into an isolated worktree and index. No working file or
+    /// live index changes until every required blob has been read successfully.
+    fn prepare_recovery(
+        &self,
+        hash: &str,
+        files: Option<&[String]>,
+    ) -> Result<(tempfile::TempDir, Vec<String>), CoreError> {
+        let mut env = self.recovery_env()?;
+        self.own_recovery_tree(hash, &env)?;
+        let stage = tempfile::Builder::new()
+            .prefix("recovery-")
+            .tempdir_in(&self.gitdir)?;
+        let tree = stage.path().join("tree");
+        std::fs::create_dir(&tree)?;
+        env.push(("GIT_INDEX_FILE", git_path(&stage.path().join("index"))));
+        let args = |cmd: &[&str]| {
+            let mut args = self.args(&CORE, cmd);
+            let index = args.iter().position(|arg| arg == "--work-tree").unwrap() + 1;
+            args[index] = git_path(&tree);
+            args
+        };
+        let read = self.git_env(&args(&["read-tree", hash]), Some(&tree), &env, None);
+        if read.exit_code != 0 {
+            return Err(snapshot_error("read recovery tree", hash, &read));
+        }
+        let listed = self.git_env(
+            &args(&["ls-files", "--stage", "-z"]),
+            Some(&tree),
+            &env,
+            None,
+        );
+        if listed.exit_code != 0 {
+            return Err(snapshot_error("list recovery files", hash, &listed));
+        }
+        let have: Vec<String> = listed
+            .text
+            .split('\0')
+            .filter_map(|entry| {
+                let (meta, file) = entry.split_once('\t')?;
+                (!meta.starts_with("160000 ")).then(|| file.to_string())
+            })
+            .collect();
+        let selected: Vec<String> = match files {
+            None => have,
+            Some(files) => {
+                let have: HashSet<_> = have.into_iter().collect();
+                files
+                    .iter()
+                    .filter(|file| have.contains(*file))
+                    .cloned()
+                    .collect()
+            }
+        };
+        if !selected.is_empty() {
+            let checkout = self.git_env(
+                &args(&["checkout-index", "-f", "-z", "--stdin"]),
+                Some(&tree),
+                &env,
+                Some(&encode_nul_paths(&selected)),
+            );
+            if checkout.exit_code != 0 {
+                return Err(snapshot_error("stage recovery contents", hash, &checkout));
+            }
+        }
+        Ok((stage, selected))
+    }
+
+    fn restore_impl(&self, snapshot: &str) -> Result<(), CoreError> {
+        let _guard = self.lock();
+        let (stage, files) = self.prepare_recovery(snapshot, None)?;
+        let mut changes = Vec::new();
+        for file in files {
+            let source = stage.path().join("tree").join(&file);
+            // Gitlinks denote submodule directories, not file contents.
+            if std::fs::symlink_metadata(&source).is_ok_and(|meta| meta.is_dir()) {
+                continue;
+            }
+            changes.push(recovery::Change {
+                target: self.worktree.join(file),
+                source: Some(source),
+            });
+        }
+        recovery::apply(&self.worktree, changes)
+    }
+
     fn revert_impl(&self, patches: Vec<PatchPart>) -> Result<(), CoreError> {
         let _guard = self.lock();
-        struct Op {
-            hash: String,
-            file: String,
-            rel: String,
-        }
-        let mut ops: Vec<Op> = Vec::new();
-        let mut seen = HashSet::new();
-        // The file list comes from stored session data, which an imported
-        // or shared session controls. A path outside the worktree is never
-        // in a snapshot, so reverting it could only delete it.
         let instance = crate::tool::def::InstanceContext {
             directory: self.worktree.clone(),
             worktree: self.worktree.clone(),
         };
-        for item in patches {
-            for file in &item.files {
-                if !seen.insert(file.clone()) {
-                    continue;
-                }
-                // Checked and acted on in one spelling: `..` is folded
-                // away first, so what git and `remove_file` are handed is
-                // the path that was judged.
-                let normal = crate::git::lexical_normalize(Path::new(file));
+        let mut seen = HashSet::new();
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        let mut order = Vec::new();
+        for patch in patches {
+            for file in patch.files {
+                let normal = crate::git::lexical_normalize(Path::new(&file));
                 if !normal.is_absolute()
                     || !crate::tool::external_directory::contains_path(&normal, &instance)
                 {
-                    tracing::warn!("not reverting a file outside the worktree: file={file}");
+                    tracing::warn!(file, "not reverting a file outside the worktree");
                     continue;
                 }
-                let file = &normal.to_string_lossy().into_owned();
-                ops.push(Op {
-                    hash: item.hash.clone(),
-                    file: file.clone(),
-                    rel: relative(&self.worktree, file),
-                });
-            }
-        }
-
-        // Validate every referenced tree before touching any file. A missing
-        // object is an inspection failure, never evidence of file absence.
-        let mut checked = HashSet::new();
-        for op in &ops {
-            if checked.insert(&op.hash) {
-                let result = self.git(
-                    &self.args(&CORE, &["cat-file", "-e", &format!("{}^{{tree}}", op.hash)]),
-                    Some(&self.worktree),
-                    None,
-                );
-                if result.exit_code != 0 {
-                    return Err(snapshot_error("inspect tree", &op.hash, &result));
+                if !seen.insert(normal.clone()) {
+                    continue;
                 }
-            }
-        }
-
-        let remove = |op: &Op| -> Result<(), CoreError> {
-            match std::fs::remove_file(&op.file) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(CoreError::Storage(format!(
-                    "snapshot revert could not remove {}: {error}",
-                    op.file
-                ))),
-            }
-        };
-        let single = |op: &Op| -> Result<(), CoreError> {
-            tracing::info!("reverting: file={} hash={}", op.file, op.hash);
-            let result = self.git(
-                &self.args(&CORE, &["checkout", &op.hash, "--", &op.file]),
-                Some(&self.worktree),
-                None,
-            );
-            if result.exit_code == 0 {
-                return Ok(());
-            }
-            let tree = self.git(
-                &self.args(&CORE, &["ls-tree", &op.hash, "--", &op.rel]),
-                Some(&self.worktree),
-                None,
-            );
-            if tree.exit_code != 0 {
-                return Err(snapshot_error("ls-tree", &op.hash, &tree));
-            }
-            if !tree.text.is_empty() {
-                return Err(snapshot_error("checkout", &op.hash, &result));
-            }
-            tracing::info!("file did not exist in snapshot, deleting: file={}", op.file);
-            remove(op)
-        };
-
-        let mut i = 0usize;
-        while i < ops.len() {
-            let first = &ops[i];
-            let mut run = vec![first];
-            let mut j = i + 1;
-            // Only batch adjacent files when their paths cannot affect
-            // each other.
-            while j < ops.len() && run.len() < 100 {
-                let next = &ops[j];
-                if next.hash != first.hash {
-                    break;
-                }
-                if run.iter().any(|item| clash(&item.rel, &next.rel)) {
-                    break;
-                }
-                run.push(next);
-                j += 1;
-            }
-            if run.len() == 1 {
-                single(first)?;
-                i = j;
-                continue;
-            }
-            let mut cmd: Vec<&str> = vec!["ls-tree", "--name-only", "-z", &first.hash, "--"];
-            cmd.extend(run.iter().map(|op| op.rel.as_str()));
-            let tree = self.git(&self.args(&CORE, &cmd), Some(&self.worktree), None);
-            if tree.exit_code != 0 {
-                return Err(snapshot_error("ls-tree", &first.hash, &tree));
-            }
-            let have: HashSet<&str> = tree
-                .text
-                .split('\0')
-                .filter(|line| !line.is_empty())
-                .collect();
-            let list: Vec<&Op> = run
-                .iter()
-                .filter(|op| have.contains(op.rel.as_str()))
-                .copied()
-                .collect();
-            if !list.is_empty() {
-                tracing::info!("reverting: hash={} files={}", first.hash, list.len());
-                let mut cmd: Vec<&str> = vec!["checkout", &first.hash, "--"];
-                cmd.extend(list.iter().map(|op| op.file.as_str()));
-                let result = self.git(&self.args(&CORE, &cmd), Some(&self.worktree), None);
-                if result.exit_code != 0 {
-                    tracing::info!("batched checkout failed, falling back to single-file revert");
-                    for op in &run {
-                        single(op)?;
+                let rel = relative(&self.worktree, &git_path(&normal));
+                let group = match groups.iter().position(|(hash, _)| hash == &patch.hash) {
+                    Some(index) => index,
+                    None => {
+                        groups.push((patch.hash.clone(), Vec::new()));
+                        groups.len() - 1
                     }
-                    i = j;
-                    continue;
-                }
+                };
+                groups[group].1.push(rel.clone());
+                order.push((group, rel, normal));
             }
-            for op in &run {
-                if !have.contains(op.rel.as_str()) {
-                    tracing::info!("file did not exist in snapshot, deleting: file={}", op.file);
-                    remove(op)?;
-                }
-            }
-            i = j;
         }
-        Ok(())
+        // Stage every group's complete requested contents before any deletion
+        // or replacement; an error in a later group leaves all files intact.
+        let mut stages = Vec::new();
+        for (hash, files) in &groups {
+            let (stage, present) = self.prepare_recovery(hash, Some(files))?;
+            stages.push((stage, present.into_iter().collect::<HashSet<_>>()));
+        }
+        let changes = order
+            .into_iter()
+            .map(|(group, rel, target)| {
+                let (stage, present) = &stages[group];
+                let source = present
+                    .contains(&rel)
+                    .then(|| stage.path().join("tree").join(&rel));
+                recovery::Change { target, source }
+            })
+            .collect();
+        recovery::apply(&self.worktree, changes)
     }
 
     /// `diff` (`snapshot/index.ts:526-544`).
@@ -1434,13 +1587,6 @@ fn git_path(path: &Path) -> String {
     }
 }
 
-/// `clash` (`snapshot/index.ts:445`).
-fn clash(a: &str, b: &str) -> bool {
-    a == b
-        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
-        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
-}
-
 /// The hourly snapshot packing loop (`snapshot/index.ts:761-766`):
 /// one run after a 1-minute delay, then every hour.
 fn spawn_cleanup_loop(snapshot: Arc<GitSnapshot>, first: Duration, interval: Duration) {
@@ -1816,6 +1962,195 @@ mod git_tests {
     }
 
     #[tokio::test]
+    async fn legacy_snapshots_are_dissociated_before_new_capture() {
+        let dir = TempDir::new("snap-legacy-migrate");
+        init_repo(dir.path());
+        let (snap, _data) = snapshot(dir.path());
+        let old = borrowed_snapshot(dir.path(), &snap);
+        snap.track().await.unwrap();
+        assert!(!snap.gitdir.join("objects/info/alternates").exists());
+        std::fs::write(dir.path().join("b.txt"), "source replacement\n").unwrap();
+        let git = SubprocessGit;
+        assert_eq!(git.run(Some(dir.path()), &["add", "b.txt"]).exit_code, 0);
+        assert_eq!(
+            git.run(Some(dir.path()), &["prune", "--expire=now"])
+                .exit_code,
+            0
+        );
+        snap.restore(&old).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "borrowed original\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_local_blob_is_detected_before_working_files_change() {
+        for restore in [true, false] {
+            let dir = TempDir::new("snap-local-missing");
+            init_repo(dir.path());
+            for name in ["a.txt", "b.txt"] {
+                std::fs::write(dir.path().join(name), format!("original {name}\n")).unwrap();
+            }
+            let (snap, _data) = snapshot(dir.path());
+            let hash = snap.track().await.unwrap();
+            let blob = snap
+                .git(
+                    &snap.args(&CORE, &["rev-parse", &format!("{hash}:b.txt")]),
+                    Some(dir.path()),
+                    None,
+                )
+                .text
+                .trim()
+                .to_string();
+            std::fs::remove_file(
+                snap.gitdir
+                    .join("objects")
+                    .join(&blob[..2])
+                    .join(&blob[2..]),
+            )
+            .unwrap();
+            for name in ["a.txt", "b.txt"] {
+                std::fs::write(dir.path().join(name), "current work\n").unwrap();
+            }
+            let result = if restore {
+                snap.restore(&hash).await
+            } else {
+                snap.revert(vec![PatchPart {
+                    hash: hash.clone(),
+                    files: ["a.txt", "b.txt"]
+                        .map(|name| git_path(&dir.path().join(name)))
+                        .to_vec(),
+                }])
+                .await
+            };
+            assert!(result.is_err());
+            for name in ["a.txt", "b.txt"] {
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                    "current work\n"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_owns_staged_blobs_after_source_pruning() {
+        let dir = TempDir::new("snap-borrowed-owned");
+        init_repo(dir.path());
+        let file = dir.path().join("important.txt");
+        std::fs::write(&file, "staged original\n").unwrap();
+        let git = SubprocessGit;
+        assert_eq!(
+            git.run(Some(dir.path()), &["add", "important.txt"])
+                .exit_code,
+            0
+        );
+        let (snap, _data) = snapshot(dir.path());
+        let hash = snap.track().await.unwrap();
+        std::fs::write(&file, "current work\n").unwrap();
+        assert_eq!(
+            git.run(Some(dir.path()), &["add", "important.txt"])
+                .exit_code,
+            0
+        );
+        assert_eq!(
+            git.run(Some(dir.path()), &["prune", "--expire=now"])
+                .exit_code,
+            0
+        );
+        snap.restore(&hash).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "staged original\n");
+        std::fs::write(&file, "more current work\n").unwrap();
+        snap.revert(vec![PatchPart {
+            hash,
+            files: vec![git_path(&file)],
+        }])
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "staged original\n");
+    }
+
+    // Build the on-disk format used before independent object ownership.
+    fn borrowed_snapshot(dir: &Path, snap: &GitSnapshot) -> String {
+        let git = SubprocessGit;
+        std::fs::write(dir.join("b.txt"), "borrowed original\n").unwrap();
+        assert_eq!(git.run(Some(dir), &["add", "b.txt"]).exit_code, 0);
+        std::fs::create_dir_all(&snap.gitdir).unwrap();
+        assert_eq!(
+            snap.git_env(
+                &["init".into()],
+                None,
+                &[("GIT_DIR", git_path(&snap.gitdir))],
+                None
+            )
+            .exit_code,
+            0
+        );
+        std::fs::create_dir_all(snap.gitdir.join("objects/info")).unwrap();
+        std::fs::write(
+            snap.gitdir.join("objects/info/alternates"),
+            format!("{}\n", dir.join(".git/objects").display()),
+        )
+        .unwrap();
+        std::fs::copy(dir.join(".git/index"), snap.gitdir.join("index")).unwrap();
+        std::fs::write(dir.join("a.txt"), "local original\n").unwrap();
+        snap.stage(&["a.txt".into()]);
+        let tree = snap.git(&snap.args(&CORE, &["write-tree"]), Some(dir), None);
+        assert_eq!(tree.exit_code, 0, "{}", tree.stderr);
+        tree.text.trim().to_string()
+    }
+
+    #[tokio::test]
+    async fn missing_borrowed_blob_preserves_every_file_before_recovery() {
+        for restore in [true, false] {
+            let dir = TempDir::new("snap-borrowed-missing");
+            init_repo(dir.path());
+            let (snap, _data) = snapshot(dir.path());
+            let hash = borrowed_snapshot(dir.path(), &snap);
+            std::fs::write(dir.path().join("a.txt"), "current a\n").unwrap();
+            std::fs::write(dir.path().join("b.txt"), "current b\n").unwrap();
+            let git = SubprocessGit;
+            assert_eq!(git.run(Some(dir.path()), &["add", "b.txt"]).exit_code, 0);
+            assert_eq!(
+                git.run(Some(dir.path()), &["prune", "--expire=now"])
+                    .exit_code,
+                0
+            );
+            assert_eq!(
+                snap.git(
+                    &snap.args(&CORE, &["cat-file", "-e", &hash]),
+                    Some(dir.path()),
+                    None
+                )
+                .exit_code,
+                0
+            );
+            let result = if restore {
+                snap.restore(&hash).await
+            } else {
+                snap.revert(vec![PatchPart {
+                    hash: hash.clone(),
+                    files: vec![
+                        git_path(&dir.path().join("a.txt")),
+                        git_path(&dir.path().join("b.txt")),
+                    ],
+                }])
+                .await
+            };
+            assert!(result.is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "current a\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+                "current b\n"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn historical_snapshots_remain_reachable_after_gc() {
         let dir = TempDir::new("snap-retained");
         init_repo(dir.path());
@@ -2109,7 +2444,7 @@ mod git_tests {
     }
 
     #[tokio::test]
-    async fn seed_shares_the_source_object_database() {
+    async fn seed_owns_the_source_index_objects() {
         let dir = TempDir::new("snap-seed");
         init_repo(dir.path());
         std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
@@ -2119,12 +2454,38 @@ mod git_tests {
         snap.track().await.unwrap();
 
         let gitdir = gitdir(data.path(), dir.path());
-        let alternates = std::fs::read_to_string(gitdir.join("objects/info/alternates")).unwrap();
         assert!(
-            alternates.contains(".git/objects"),
-            "alternates points at the source object database: {alternates}"
+            !gitdir.join("objects/info/alternates").exists(),
+            "snapshots must not borrow objects"
         );
         assert!(gitdir.join("index").exists(), "source index copied");
+    }
+
+    #[tokio::test]
+    async fn seed_owns_file_blobs_without_copying_submodule_commit_objects() {
+        let dir = TempDir::new("snap-seed-submodule");
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "original\n").unwrap();
+        let submodule = dir.path().join("vendor");
+        std::fs::create_dir(&submodule).unwrap();
+        init_repo(&submodule);
+        std::fs::write(submodule.join("file.txt"), "submodule original\n").unwrap();
+        commit_all(&submodule);
+        commit_all(dir.path());
+
+        let (snap, _data) = snapshot(dir.path());
+        let hash = snap.track().await.expect("snapshot of a submodule index");
+        std::fs::write(dir.path().join("a.txt"), "current\n").unwrap();
+        std::fs::write(submodule.join("file.txt"), "submodule current\n").unwrap();
+        snap.restore(&hash).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "original\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(submodule.join("file.txt")).unwrap(),
+            "submodule current\n"
+        );
     }
 
     #[tokio::test]
@@ -2429,14 +2790,5 @@ mod git_tests {
         // Trailing data after all refs consumed.
         let trailing = format!("{head} blob 1\na\nextra\n");
         assert!(parse_cat_file(&refs, trailing.as_bytes()).is_none());
-    }
-
-    #[tokio::test]
-    async fn clash_matrix() {
-        assert!(clash("a/b", "a/b"));
-        assert!(clash("a/b/c", "a/b"));
-        assert!(clash("a/b", "a/b/c"));
-        assert!(!clash("a/bc", "a/b"));
-        assert!(!clash("a", "b"));
     }
 }

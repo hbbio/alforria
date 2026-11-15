@@ -19,10 +19,19 @@ The default global directories are `~/.config/alforria`,
 `alforria migrate` moves an install over; `alforria migrate --fresh` provides
 an independent start when the legacy database is incompatible.
 
-Undo snapshots are retained for the lifetime of their snapshot store. Git
-references protect new snapshot trees, and cleanup packs objects without
-expiring legacy recovery points. This favors recoverability over an automatic
-age-based disk limit.
+Undo snapshots own their objects independently of the source repository. Git
+references retain new snapshot trees, and cleanup packs objects without
+expiring recovery points. Older alternate-based stores are dissociated before
+new captures. Already-pruned legacy objects cannot be reconstructed; recovery
+reports an error without changing working files when required contents are
+unavailable.
+
+Recovery stages required contents before replacing any working file. Failed
+replacements roll back the operation. If rollback itself fails, the error
+identifies retained checkpoints containing the original files and target-path
+manifests. Recovery refuses obstructing directories and symlinked parent paths
+rather than removing unrelated work. This favors recoverability over an
+automatic age-based disk limit.
 
 Linux CI runs the ordinary Rust and web suites. macOS and Windows CI run
 focused recovery, permission, storage, history, and real PTY tests. Release
