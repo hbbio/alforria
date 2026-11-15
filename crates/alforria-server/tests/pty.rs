@@ -2,6 +2,8 @@
 //! websockets, exercised against a live listener with real portable Python
 //! processes.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -463,10 +465,13 @@ async fn ws_connect_refuses_foreign_origins() {
     let fx = fixture().await;
     let created = create(&fx, python(), &["-c", "import time; time.sleep(30)"]).await;
     let pty_id = created["id"].as_str().unwrap().to_string();
-    let v1 = format!("/pty/{pty_id}/connect?directory={}", fx.directory);
+    let v1 = format!(
+        "/pty/{pty_id}/connect?directory={}",
+        support::encode_query_value(&fx.directory)
+    );
     let v2 = format!(
         "/api/pty/{pty_id}/connect?location[directory]={}",
-        fx.directory
+        support::encode_query_value(&fx.directory)
     );
 
     // Ticketless.
@@ -528,7 +533,10 @@ async fn ws_replay_meta_frame_and_live_output() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let mut stream = ws_connect(
         &fx,
-        &format!("/pty/{pty_id}/connect?directory={}", fx.directory),
+        &format!(
+            "/pty/{pty_id}/connect?directory={}",
+            support::encode_query_value(&fx.directory)
+        ),
     )
     .await;
 
@@ -569,7 +577,10 @@ async fn ws_close_1000_when_the_session_is_removed() {
     let pty_id = created["id"].as_str().unwrap().to_string();
     let mut stream = ws_connect(
         &fx,
-        &format!("/pty/{pty_id}/connect?directory={}", fx.directory),
+        &format!(
+            "/pty/{pty_id}/connect?directory={}",
+            support::encode_query_value(&fx.directory)
+        ),
     )
     .await;
 
@@ -605,7 +616,10 @@ async fn ws_1001_on_server_close() {
     let pty_id = created["id"].as_str().unwrap().to_string();
     let mut stream = ws_connect(
         &fx,
-        &format!("/pty/{pty_id}/connect?directory={}", fx.directory),
+        &format!(
+            "/pty/{pty_id}/connect?directory={}",
+            support::encode_query_value(&fx.directory)
+        ),
     )
     .await;
     let _ = stream.next().await; // meta frame etc — ignore frames until close
@@ -647,7 +661,7 @@ async fn v2_exited_session_closes_with_4404() {
         &fx,
         &format!(
             "/api/pty/{pty_id}/connect?location[directory]={}",
-            fx.directory
+            support::encode_query_value(&fx.directory)
         ),
     )
     .await;
@@ -703,7 +717,8 @@ async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     // A ticket minted for one pty is invalid for another.
     let url = format!(
         "ws://127.0.0.1:{}/pty/{other_id}/connect?directory={}&ticket={ticket}",
-        fx.listener.port, fx.directory
+        fx.listener.port,
+        support::encode_query_value(&fx.directory)
     );
     let response = reqwest::get(url.replace("ws://", "http://")).await.unwrap();
     assert_eq!(response.status(), 403);
@@ -712,7 +727,8 @@ async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     // Valid connect consumes the ticket...
     let url = format!(
         "ws://127.0.0.1:{}/pty/{pty_id}/connect?directory={}&ticket={ticket}",
-        fx.listener.port, fx.directory
+        fx.listener.port,
+        support::encode_query_value(&fx.directory)
     );
     let (stream, _) = connect_async(url.into_client_request().unwrap())
         .await
@@ -722,7 +738,8 @@ async fn tickets_are_single_use_and_scope_bound_over_the_ws() {
     // ...and the same ticket cannot connect again.
     let url = format!(
         "ws://127.0.0.1:{}/pty/{pty_id}/connect?directory={}&ticket={ticket}",
-        fx.listener.port, fx.directory
+        fx.listener.port,
+        support::encode_query_value(&fx.directory)
     );
     let response = reqwest::get(url.replace("ws://", "http://")).await.unwrap();
     assert_eq!(response.status(), 403);
