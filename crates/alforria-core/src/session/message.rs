@@ -351,6 +351,42 @@ impl MessageStore {
         self.stream_of(COLUMNS_WITHOUT_DIFFS, session_id)
     }
 
+    /// Load only the context retained by the latest completed compaction.
+    /// Page hydration stops at that boundary, including a retained tail that
+    /// crosses pages; archived history costs no additional queries or memory.
+    pub fn active_context(&self, session_id: &str) -> Result<Vec<WithParts>, SessionError> {
+        let mut pending = Vec::new().into_iter();
+        let mut before = None;
+        let mut done = false;
+        let mut failure = None;
+        let context = filter_compacted(std::iter::from_fn(|| loop {
+            if let Some(message) = pending.next() {
+                return Some(message);
+            }
+            if done {
+                return None;
+            }
+            match self.page_without_diffs(session_id, 50, before.as_deref()) {
+                Ok(page) => {
+                    done = !page.more || page.cursor.is_none();
+                    before = page.cursor;
+                    pending = page.items.into_iter().rev().collect::<Vec<_>>().into_iter();
+                }
+                Err(SessionError::NotFound(_)) => {
+                    done = true;
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    done = true;
+                }
+            }
+        }));
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(context),
+        }
+    }
+
     fn stream_of(&self, columns: &str, session_id: &str) -> Result<Vec<WithParts>, SessionError> {
         let size = 50usize;
         let mut result = Vec::new();
@@ -455,7 +491,7 @@ fn is_compaction(part: &V1Part) -> bool {
 /// `filterCompacted` (message-v2.ts:521-572 — binding): retain-walk over the
 /// newest-first stream, reverse, then reorder around the last compaction
 /// into `[compaction-user, summary, tail, remainder]`.
-pub fn filter_compacted(msgs: Vec<WithParts>) -> Vec<WithParts> {
+pub fn filter_compacted(msgs: impl IntoIterator<Item = WithParts>) -> Vec<WithParts> {
     let mut result: Vec<WithParts> = Vec::new();
     let mut completed: HashSet<String> = HashSet::new();
     let mut retain: Option<String> = None;
@@ -717,6 +753,77 @@ mod tests {
 
     fn with_parts(info: V1Message, parts: Vec<V1Part>) -> WithParts {
         WithParts { info, parts }
+    }
+
+    #[test]
+    fn active_context_stops_before_archived_history_and_retains_a_cross_page_tail() {
+        use crate::session::test_support::{create_session, harness};
+        for archived in [100, 1000] {
+            for tail in [None, Some(archived - 80)] {
+                let h = harness("context-boundary", vec![]);
+                let session = create_session(&h.services.sessions, &h.worktree);
+                for index in 0..archived {
+                    h.services
+                        .sessions
+                        .update_message(&user_message(
+                            &format!("msg_{index:05}"),
+                            &session.id,
+                            index as f64,
+                        ))
+                        .unwrap();
+                }
+                let compact = "msg_compact";
+                let summary = "msg_summary";
+                h.services
+                    .sessions
+                    .update_message(&user_message(compact, &session.id, archived as f64))
+                    .unwrap();
+                let tail_id = tail.map(|index| format!("msg_{index:05}"));
+                h.services
+                    .sessions
+                    .update_part(&compaction_part(
+                        "prt_compact",
+                        &session.id,
+                        compact,
+                        tail_id.as_deref(),
+                    ))
+                    .unwrap();
+                h.services
+                    .sessions
+                    .update_message(&assistant_message(
+                        summary,
+                        &session.id,
+                        archived + 1,
+                        compact,
+                        Some(true),
+                        Some("stop".into()),
+                    ))
+                    .unwrap();
+                let expected = filter_compacted(
+                    h.services
+                        .messages
+                        .stream_without_diffs(&session.id)
+                        .unwrap(),
+                );
+                // This row is older than all pages needed for the active
+                // context. Eager hydration fails if it ever reads the row.
+                h.services
+                    .storage
+                    .with_connection(|conn| {
+                        conn.execute("UPDATE message SET data = '{}' WHERE id = 'msg_00000'", [])
+                    })
+                    .unwrap();
+                assert_eq!(
+                    h.services.messages.active_context(&session.id).unwrap(),
+                    expected
+                );
+                assert!(h
+                    .services
+                    .messages
+                    .stream_without_diffs(&session.id)
+                    .is_err());
+            }
+        }
     }
 
     #[test]
