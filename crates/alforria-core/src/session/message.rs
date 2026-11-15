@@ -362,6 +362,20 @@ impl MessageStore {
         let rows = self.storage.with_connection(|conn| {
             query_messages(conn, &turn_query(), [session_id, message_id])
         })?;
+        if rows.is_empty() {
+            let exists: bool = self.storage.with_connection(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session WHERE id = ?1)",
+                    [session_id],
+                    |row| row.get(0),
+                )
+            })?;
+            if !exists {
+                return Err(SessionError::not_found(format!(
+                    "Session not found: {session_id}"
+                )));
+            }
+        }
         Ok(self.hydrate_parts(&rows, true)?)
     }
 
@@ -951,12 +965,10 @@ mod tests {
             !plan.iter().any(|line| line.starts_with("SCAN message")),
             "{plan:?}"
         );
-        assert!(h
-            .services
-            .messages
-            .turn_snapshots("other_session", "msg_u")
-            .unwrap()
-            .is_empty());
+        assert!(matches!(
+            h.services.messages.turn_snapshots("other_session", "msg_u"),
+            Err(SessionError::NotFound(_))
+        ));
     }
 
     #[test]

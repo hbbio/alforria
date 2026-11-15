@@ -253,7 +253,10 @@ impl SessionSummary {
         };
         let info = match self.deps.sessions.message_info(session_id, message_id) {
             Ok(info) => info,
-            Err(SessionError::NotFound(_)) => return Ok(Vec::new()),
+            Err(SessionError::NotFound(_)) => {
+                self.deps.sessions.get(session_id)?;
+                return Ok(Vec::new());
+            }
             Err(error) => return Err(error),
         };
         if !matches!(info, V1Message::User { .. }) {
@@ -759,6 +762,29 @@ mod tests {
             summary.attach_diffs(&session.id, user).await.unwrap();
             assert_eq!(message_updated_count(&h), written);
         }
+    }
+
+    #[tokio::test]
+    async fn summary_queries_preserve_missing_session_and_message_behavior() {
+        let h = harness("summary-missing", vec![]);
+        let session = create_session(&h.services.sessions, &h.worktree);
+        let summary = summary_service(&h);
+        summary
+            .attach_diffs(&session.id, "msg_missing")
+            .await
+            .unwrap();
+        assert!(summary
+            .diff(&session.id, Some("msg_missing"))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            summary.attach_diffs("ses_missing", "msg_missing").await,
+            Err(SessionError::NotFound(_))
+        ));
+        assert!(matches!(
+            summary.diff("ses_missing", Some("msg_missing")),
+            Err(SessionError::NotFound(_))
+        ));
     }
 
     #[tokio::test]
