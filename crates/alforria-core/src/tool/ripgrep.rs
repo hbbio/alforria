@@ -602,6 +602,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual benchmark: cargo test -p alforria-core benchmark_buffered_search -- --ignored --nocapture"]
+    fn benchmark_buffered_search() {
+        use std::io::Write;
+        let temp = crate::storage::test_support::TempDir::new("search-benchmark");
+        let line = format!("{} match\n", "x".repeat(1017));
+        for index in 0..32 {
+            let mut file = std::io::BufWriter::new(
+                std::fs::File::create(temp.path().join(format!("file{index}.txt"))).unwrap(),
+            );
+            for _ in 0..1024 {
+                file.write_all(line.as_bytes()).unwrap();
+            }
+        }
+        for (pattern, expected) in [("absent-pattern", 0), ("match", 250)] {
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                let matches = RipgrepService
+                    .grep(temp.path(), pattern, None, 250)
+                    .unwrap();
+                assert_eq!(matches.len(), expected);
+                std::hint::black_box(matches);
+            }
+            println!(
+                "files=32, input_mib=32, pattern={pattern}, matches={expected}, mean_us={}",
+                start.elapsed().as_micros() / 10
+            );
+        }
+    }
+
+    #[test]
     fn cancellation_is_checked_during_reads_without_matches() {
         struct CancelOnRead {
             token: CancellationToken,

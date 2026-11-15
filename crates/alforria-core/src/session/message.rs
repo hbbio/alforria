@@ -756,6 +756,70 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual benchmark: cargo test -p alforria-core benchmark_active_context -- --ignored --nocapture"]
+    fn benchmark_active_context_with_archived_history() {
+        use crate::session::test_support::{create_session, harness};
+        for archived in [100, 1000, 10_000] {
+            let h = harness("context-benchmark", vec![]);
+            let session = create_session(&h.services.sessions, &h.worktree);
+            for index in 0..archived {
+                h.services
+                    .sessions
+                    .update_message(&user_message(
+                        &format!("msg_{index:05}"),
+                        &session.id,
+                        index as f64,
+                    ))
+                    .unwrap();
+            }
+            h.services
+                .sessions
+                .update_message(&user_message("msg_compact", &session.id, archived as f64))
+                .unwrap();
+            h.services
+                .sessions
+                .update_part(&compaction_part(
+                    "prt_compact",
+                    &session.id,
+                    "msg_compact",
+                    None,
+                ))
+                .unwrap();
+            h.services
+                .sessions
+                .update_message(&assistant_message(
+                    "msg_summary",
+                    &session.id,
+                    archived + 1,
+                    "msg_compact",
+                    Some(true),
+                    Some("stop".into()),
+                ))
+                .unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                let context = h.services.messages.active_context(&session.id).unwrap();
+                assert_eq!(context.len(), 2);
+                std::hint::black_box(context);
+            }
+            let active = start.elapsed().as_micros() / 100;
+            let start = std::time::Instant::now();
+            for _ in 0..10 {
+                std::hint::black_box(filter_compacted(
+                    h.services
+                        .messages
+                        .stream_without_diffs(&session.id)
+                        .unwrap(),
+                ));
+            }
+            println!(
+                "archived={archived}, active_messages=2, lazy_us={active}, eager_us={}",
+                start.elapsed().as_micros() / 10
+            );
+        }
+    }
+
+    #[test]
     fn active_context_stops_before_archived_history_and_retains_a_cross_page_tail() {
         use crate::session::test_support::{create_session, harness};
         for archived in [100, 1000] {
