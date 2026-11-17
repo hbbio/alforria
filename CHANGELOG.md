@@ -7,6 +7,13 @@ pre-1.0, so minor releases may include breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- TUI: `/review ` offers recent commits with their subjects and an
+  uncommitted-changes option. Tab completes a target; arrow keys and Enter
+  select and review it. Suggestions come from the server's repository,
+  including when attached remotely.
+
 ### Changed
 
 - TUI: `/copy` now copies the last assistant message as Markdown. Use

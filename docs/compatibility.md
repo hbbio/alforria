@@ -13,6 +13,11 @@ reference material is recorded in [fixtures/PINNED.md](../fixtures/PINNED.md).
 | Configuration | The pinned configuration contract plus alforria extensions. Names such as `opencode.json`, `.opencode/`, and `OPENCODE_*` remain unchanged. Newer upstream configurations have no general compatibility guarantee. |
 | Storage | Alforria owns its database schema and application directories. Databases migrated by newer OpenCode v2 are explicitly refused; applications should not share a database. |
 
+Review completion uses alforria's `GET /experimental/vcs/commits` extension,
+outside the pinned API documents. It returns up to 50 recent commits from
+the selected directory or workspace. Older servers still accept typed review
+targets without completion.
+
 The default global directories are `~/.config/alforria`,
 `~/.local/share/alforria`, and the platform equivalents. An existing legacy
 `opencode` directory is used only until its alforria counterpart exists.

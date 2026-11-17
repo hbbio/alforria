@@ -81,6 +81,12 @@ copying for `/copy`, add this to your global or project `tui.json`:
 
 The default `copy_mode` is `"last_message"`.
 
+Use `/review` for uncommitted changes or `/review <hash>` for a commit
+(short and full hashes work). In the TUI, type `/review ` to browse recent
+commits by hash or subject. Tab fills a suggestion; arrow keys and Enter
+review a selected entry. Enter without a selection reviews what you typed.
+Branch names and pull request references also work.
+
 ## What's inside
 
 - **Terminal UI.** A ratatui chat view with sessions, subagents, diffs,
